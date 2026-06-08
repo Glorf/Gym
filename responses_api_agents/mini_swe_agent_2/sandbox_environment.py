@@ -132,9 +132,19 @@ class MiniSWESandboxEnvironment:
             return command
         quoted_cwd = shlex.quote(cwd)
         quoted_env = shlex.quote(self.config.conda_env)
+        # Resolve conda from common install roots before activating. The exec
+        # shell is non-login/non-interactive (e.g. `bash -c` on the ECS exec
+        # server), so `conda` is not on PATH and `conda info --base` cannot be
+        # relied on. Source the first available conda.sh (SWE-bench images ship
+        # /opt/miniconda3), falling back to `conda info --base` only when conda
+        # already happens to be on PATH. Using a grouped loop (not an `&&`
+        # chain) keeps a missing path from aborting the whole command.
         return (
             f"cd {quoted_cwd} && "
-            "source $(conda info --base)/etc/profile.d/conda.sh && "
+            '{ for __base in /opt/miniconda3 /opt/conda "$HOME/miniconda3" '
+            '"$(command -v conda >/dev/null 2>&1 && conda info --base 2>/dev/null)"; do '
+            '[ -n "$__base" ] && [ -f "$__base/etc/profile.d/conda.sh" ] && '
+            '. "$__base/etc/profile.d/conda.sh" && break; done; } && '
             f"conda activate {quoted_env} && "
             f"{command}"
         )
