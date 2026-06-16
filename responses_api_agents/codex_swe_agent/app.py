@@ -180,7 +180,11 @@ def extract_instruction(body_input: Any) -> tuple[str, Optional[str]]:
 
 
 def codex_config_toml(*, base_url: str, model: str, api_key_env: str = "OPENAI_API_KEY") -> str:
-    """Codex ``config.toml`` routing the chat-completions wire API at our proxy."""
+    """Codex ``config.toml`` routing the Responses wire API at our proxy.
+
+    codex >= 0.14 dropped ``wire_api = "chat"``; it speaks the OpenAI Responses
+    API, so the proxy forwards ``/v1/responses`` to the backend.
+    """
     return (
         f'model = "{model}"\n'
         'model_provider = "gym"\n'
@@ -188,7 +192,7 @@ def codex_config_toml(*, base_url: str, model: str, api_key_env: str = "OPENAI_A
         'name = "gym"\n'
         f'base_url = "{base_url}"\n'
         f'env_key = "{api_key_env}"\n'
-        'wire_api = "chat"\n'
+        'wire_api = "responses"\n'
     )
 
 
@@ -236,9 +240,19 @@ class CodexSweAgentConfig(BaseResponsesAPIAgentConfig):
     image_template: Optional[str] = None  # e.g. "swebench/sweb.eval.x86_64.{instance_id}:latest"
     workdir: str = "/workspace"
 
-    # codex in-box
+    # codex in-box. The default bootstraps a static Node (image-agnostic, no root
+    # pkg manager needed beyond curl/xz) then installs codex globally under it.
     install_codex_in_box: bool = True
-    codex_install_command: str = "npm install -g @openai/codex@latest"
+    node_bin_dir: str = "/opt/nodejs/bin"
+    codex_install_command: str = (
+        "set -e; command -v curl >/dev/null 2>&1 || "
+        "(apt-get update -qq && apt-get install -y -qq curl xz-utils >/dev/null 2>&1) || true; "
+        "if [ ! -x /opt/nodejs/bin/node ]; then mkdir -p /opt/nodejs && "
+        "curl -fsSL https://nodejs.org/dist/v22.15.0/node-v22.15.0-linux-x64.tar.xz "
+        "| tar -xJ --strip-components=1 -C /opt/nodejs; fi; "
+        "export PATH=/opt/nodejs/bin:$PATH; npm install -g @openai/codex@latest"
+    )
+    model_api_key: str = ""  # pragma: allowlist secret — real upstream key (proxy injects it)
     codex_sandbox_mode: str = "workspace-write"
     skip_git_repo_check: bool = True
     system_prompt: Optional[str] = None
@@ -268,15 +282,17 @@ class CodexSweAgent(SimpleResponsesAPIAgent):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def _resolve_base_url(self) -> str:
+        # Model ROOT (no trailing /v1): the proxy forwards the agent's full path
+        # (e.g. /v1/chat/completions) onto this, so /v1 must not be doubled.
         if self.config.model_server:
             cfg = get_first_server_config_dict(
                 self.server_client.global_config_dict,
                 self.config.model_server.name,
             )
-            return f"{self.server_client._build_server_base_url(cfg)}/v1"
-        return self.config.model_base_url or ""
+            return self.server_client._build_server_base_url(cfg)
+        return (self.config.model_base_url or "").rstrip("/")
 
-    def _sandbox_spec(self, metadata: dict[str, Any]) -> SandboxSpec:
+    def _sandbox_spec(self, metadata: dict[str, Any], proxy: Any) -> SandboxSpec:
         image = self.config.image
         if self.config.image_template and metadata.get("instance_id"):
             image = self.config.image_template.format(instance_id=metadata["instance_id"])
@@ -285,6 +301,11 @@ class CodexSweAgent(SimpleResponsesAPIAgent):
             workdir=self.config.workdir,
             timeout_s=self.config.timeout_s,
             metadata={"instance_id": str(metadata.get("instance_id") or "")},
+            # Reverse-tunnel the harness-side capture proxy into the box; the agent
+            # reads its in-box address back via sandbox.resolved_endpoint_url().
+            provider_options={
+                "outside_endpoints": [{"url": proxy.handle.url + "/v1", "env_var": "OPENAI_BASE_URL"}]
+            },
         )
 
     async def responses(
@@ -336,25 +357,29 @@ class CodexSweAgent(SimpleResponsesAPIAgent):
             host=self.config.proxy_host,
             advertise_url=self.config.proxy_advertise_url,
             inject_extra_body=inject,
+            upstream_api_key=self.config.model_api_key or None,
             request_timeout=float(self.config.timeout_s),
         )
 
-        sandbox = AsyncSandbox(self.config.sandbox, self._sandbox_spec(metadata), delete_on_stop=True)
+        sandbox = AsyncSandbox(self.config.sandbox, self._sandbox_spec(metadata, proxy), delete_on_stop=True)
         codex_stdout = ""
         patch = ""
         test_output = ""
         try:
             await sandbox.start()
 
+            # In-box address of the capture proxy via the provider reverse tunnel;
+            # falls back to the harness URL for same-host providers.
+            box_base_url = sandbox.resolved_endpoint_url("OPENAI_BASE_URL") or proxy.sandbox_base_url
+            path_prefix = f"export PATH={shlex.quote(self.config.node_bin_dir)}:$PATH"
             box_env = {
-                "OPENAI_API_KEY": "dummy-key",  # pragma: allowlist secret
-                "OPENAI_BASE_URL": proxy.sandbox_base_url,
+                "OPENAI_API_KEY": "dummy-key",  # pragma: allowlist secret — proxy injects the real key
                 "CODEX_HOME": codex_home,
             }
             await sandbox.exec(f"mkdir -p {shlex.quote(codex_home)}")
             await sandbox.exec(
                 f"cat > {shlex.quote(codex_home + '/config.toml')} <<'EOF'\n"
-                f"{codex_config_toml(base_url=proxy.sandbox_base_url, model=self.config.model)}EOF"
+                f"{codex_config_toml(base_url=box_base_url, model=self.config.model)}EOF"
             )
             if self.config.install_codex_in_box:
                 install = await sandbox.exec(self.config.codex_install_command, timeout_s=self.config.timeout_s)
@@ -368,7 +393,9 @@ class CodexSweAgent(SimpleResponsesAPIAgent):
                 skip_git_repo_check=self.config.skip_git_repo_check,
                 codex_home=codex_home,
             )
-            result = await sandbox.exec(cmd, cwd=self.config.workdir, env=box_env, timeout_s=self.config.timeout_s)
+            result = await sandbox.exec(
+                f"{path_prefix} && {cmd}", cwd=self.config.workdir, env=box_env, timeout_s=self.config.timeout_s
+            )
             codex_stdout = result.stdout or ""
 
             patch_res = await sandbox.exec(

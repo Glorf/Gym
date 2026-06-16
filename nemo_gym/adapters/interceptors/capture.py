@@ -65,11 +65,16 @@ class Interceptor(RequestInterceptor, ResponseInterceptor):
         session_id: str | None = None,
         inject_extra_body: dict[str, Any] | None = None,
         record_requests: bool = True,
+        upstream_api_key: str | None = None,
     ) -> None:
         self._store = CaptureStore(store_dir)
         self._session_id = session_id
         self._inject_extra_body = inject_extra_body or {}
         self._record_requests = record_requests
+        # When set, the real upstream key is stamped onto the *forwarded* request
+        # so the in-box agent only ever holds a dummy. It is applied to the
+        # headers (which are NOT persisted), never to the recorded body.
+        self._upstream_api_key = upstream_api_key
 
     def _session(self, ctx_extra: dict[str, Any]) -> str:
         return self._session_id or ctx_extra.get(_SESSION_KEY) or "session"
@@ -80,6 +85,8 @@ class Interceptor(RequestInterceptor, ResponseInterceptor):
                 req.body.setdefault(key, value)
             if self._record_requests:
                 req.ctx.extra[_REQUEST_KEY] = req.body
+        if self._upstream_api_key:
+            req.headers["Authorization"] = f"Bearer {self._upstream_api_key}"
         return req
 
     async def intercept_response(self, resp: AdapterResponse) -> AdapterResponse:

@@ -68,6 +68,7 @@ def start_capture_proxy(
     request_timeout: float = 600.0,
     translate_anthropic: bool = False,
     translate_model_override: str | None = None,
+    upstream_api_key: str | None = None,
     extra_adapters: list[dict[str, Any]] | None = None,
 ) -> SandboxCaptureProxy:
     """Start a localhost proxy bound to ``session_id`` that captures model traffic.
@@ -93,6 +94,7 @@ def start_capture_proxy(
                 "store_dir": store_dir,
                 "session_id": session_id,
                 "inject_extra_body": inject_extra_body or {},
+                "upstream_api_key": upstream_api_key,
             },
         }
     )

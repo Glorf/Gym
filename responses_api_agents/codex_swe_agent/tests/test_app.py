@@ -69,7 +69,7 @@ def test_codex_config_toml_routes_through_proxy():
     toml = codex_config_toml(base_url="http://10.0.0.5:8080/v1", model="gpt-5-codex")
     assert 'base_url = "http://10.0.0.5:8080/v1"' in toml
     assert 'model = "gpt-5-codex"' in toml
-    assert 'wire_api = "chat"' in toml
+    assert 'wire_api = "responses"' in toml
     assert "model_provider = \"gym\"" in toml
 
 

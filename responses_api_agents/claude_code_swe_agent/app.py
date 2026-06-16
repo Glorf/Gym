@@ -124,7 +124,16 @@ class ClaudeCodeSweAgentConfig(BaseResponsesAPIAgentConfig):
     workdir: str = "/testbed"
 
     install_claude_in_box: bool = True
-    claude_install_command: str = "npm install -g @anthropic-ai/claude-code@latest"
+    node_bin_dir: str = "/opt/nodejs/bin"
+    claude_install_command: str = (
+        "set -e; command -v curl >/dev/null 2>&1 || "
+        "(apt-get update -qq && apt-get install -y -qq curl xz-utils >/dev/null 2>&1) || true; "
+        "if [ ! -x /opt/nodejs/bin/node ]; then mkdir -p /opt/nodejs && "
+        "curl -fsSL https://nodejs.org/dist/v22.15.0/node-v22.15.0-linux-x64.tar.xz "
+        "| tar -xJ --strip-components=1 -C /opt/nodejs; fi; "
+        "export PATH=/opt/nodejs/bin:$PATH; npm install -g @anthropic-ai/claude-code@latest"
+    )
+    model_api_key: str = ""  # pragma: allowlist secret — real upstream key (proxy injects it)
     system_prompt: Optional[str] = None
     allowed_tools: Optional[str] = None
     disallowed_tools: Optional[str] = None
@@ -152,15 +161,16 @@ class ClaudeCodeSweAgent(SimpleResponsesAPIAgent):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def _resolve_base_url(self) -> str:
+        # Model ROOT (no /v1): the proxy forwards the agent's full path onto it.
         if self.config.model_server:
             cfg = get_first_server_config_dict(
                 self.server_client.global_config_dict,
                 self.config.model_server.name,
             )
-            return f"{self.server_client._build_server_base_url(cfg)}/v1"
-        return self.config.model_base_url or ""
+            return self.server_client._build_server_base_url(cfg)
+        return (self.config.model_base_url or "").rstrip("/")
 
-    def _sandbox_spec(self, metadata: dict[str, Any]) -> SandboxSpec:
+    def _sandbox_spec(self, metadata: dict[str, Any], proxy: Any) -> SandboxSpec:
         image = self.config.image
         if self.config.image_template and metadata.get("instance_id"):
             image = self.config.image_template.format(instance_id=metadata["instance_id"])
@@ -169,6 +179,11 @@ class ClaudeCodeSweAgent(SimpleResponsesAPIAgent):
             workdir=self.config.workdir,
             timeout_s=self.config.timeout_s,
             metadata={"instance_id": str(metadata.get("instance_id") or "")},
+            # Claude appends /v1/messages, so the endpoint URL has no /v1; the
+            # translate interceptor rewrites it to /v1/chat/completions upstream.
+            provider_options={
+                "outside_endpoints": [{"url": proxy.handle.url, "env_var": "ANTHROPIC_BASE_URL"}]
+            },
         )
 
     async def responses(
@@ -215,22 +230,25 @@ class ClaudeCodeSweAgent(SimpleResponsesAPIAgent):
             host=self.config.proxy_host,
             advertise_url=self.config.proxy_advertise_url,
             inject_extra_body=inject,
+            upstream_api_key=self.config.model_api_key or None,
             request_timeout=float(self.config.timeout_s),
             translate_anthropic=True,
             translate_model_override=self.config.model,
         )
 
-        sandbox = AsyncSandbox(self.config.sandbox, self._sandbox_spec(metadata), delete_on_stop=True)
+        sandbox = AsyncSandbox(self.config.sandbox, self._sandbox_spec(metadata, proxy), delete_on_stop=True)
         claude_stdout = ""
         patch = ""
         test_output = ""
         try:
             await sandbox.start()
 
+            box_base_url = sandbox.resolved_endpoint_url("ANTHROPIC_BASE_URL") or proxy.sandbox_base_url
+            path_prefix = f"export PATH={shlex.quote(self.config.node_bin_dir)}:$PATH"
             box_env = {
-                "ANTHROPIC_API_KEY": "dummy-key",  # pragma: allowlist secret
+                "ANTHROPIC_API_KEY": "dummy-key",  # pragma: allowlist secret — proxy injects the real key
                 "ANTHROPIC_AUTH_TOKEN": "local",  # pragma: allowlist secret
-                "ANTHROPIC_BASE_URL": proxy.sandbox_base_url,
+                "ANTHROPIC_BASE_URL": box_base_url,
                 "ANTHROPIC_MODEL": self.config.model,
                 "IS_SANDBOX": "1",
                 "CLAUDE_CONFIG_DIR": config_dir,
@@ -252,7 +270,9 @@ class ClaudeCodeSweAgent(SimpleResponsesAPIAgent):
                 allowed_tools=self.config.allowed_tools,
                 disallowed_tools=self.config.disallowed_tools,
             )
-            result = await sandbox.exec(cmd, cwd=self.config.workdir, env=box_env, timeout_s=self.config.timeout_s)
+            result = await sandbox.exec(
+                f"{path_prefix} && {cmd}", cwd=self.config.workdir, env=box_env, timeout_s=self.config.timeout_s
+            )
             claude_stdout = result.stdout or ""
 
             patch_res = await sandbox.exec(

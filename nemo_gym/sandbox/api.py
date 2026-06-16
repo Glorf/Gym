@@ -130,6 +130,18 @@ class AsyncSandbox:
             return SandboxStatus.STOPPED
         return await self._provider.status(self._handle)
 
+    def resolved_endpoint_url(self, env_var: str) -> str | None:
+        """In-box URL for an ``outside_endpoints`` entry, or ``None``.
+
+        For the harness-drives-the-box pattern the agent reaches a harness-side
+        service (e.g. the capture proxy) through the provider's reverse tunnel;
+        this returns the address that resolves to it *inside* the sandbox.
+        Provider-specific (ECS Fargate supports it); ``None`` when unsupported.
+        """
+        raw = getattr(self._handle, "raw", None)
+        resolver = getattr(raw, "resolved_endpoint_url", None)
+        return resolver(env_var) if callable(resolver) else None
+
     async def stop(self, *, delete: bool | None = None) -> None:
         if self._closed:
             return
