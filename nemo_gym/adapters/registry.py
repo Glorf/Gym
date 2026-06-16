@@ -52,6 +52,11 @@ _BUILTIN: dict[str, str] = {
 # Each family adds entries under its own family-named comment marker so
 # different families don't fight for the same diff context.
 
+# Observability / capture family — sandbox-bound trajectory + token-id capture.
+# Records each model exchange to a session-keyed store the harness reads back
+# after the run; see ``nemo_gym.adapters.capture_store``.
+_BUILTIN["capture"] = "nemo_gym.adapters.interceptors.capture"
+
 # External / plugin registrations at runtime.
 _EXTRA: dict[str, str] = {}
 
