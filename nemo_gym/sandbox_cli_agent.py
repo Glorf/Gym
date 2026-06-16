@@ -377,7 +377,11 @@ class SandboxCliAgent(SimpleResponsesAPIAgent):
 
         session_id = f"{self.session_prefix}-{uuid4().hex[:12]}"
         env_var, _with_v1, translate = self._wire()
-        inject = {"return_token_id_information": True} if self.config.return_token_ids else {}
+        # `return_token_id_information` is only understood by a token-id-capable Gym
+        # model server. Injecting it into an external OpenAI-compatible endpoint makes
+        # it reject the request (e.g. litellm: "Unknown parameter"), so gate on model_server.
+        want_token_ids = self.config.return_token_ids and self.config.model_server is not None
+        inject = {"return_token_id_information": True} if want_token_ids else {}
         eval_cmd = self._build_eval(metadata)
 
         proxy = start_capture_proxy(
