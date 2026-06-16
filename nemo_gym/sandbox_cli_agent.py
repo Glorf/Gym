@@ -113,6 +113,16 @@ def extract_instruction(body_input: Any) -> tuple[str, Optional[str]]:
     return user_message, system_message
 
 
+def swebench_image_tag(instance_id: str) -> str:
+    """Map a SWE-bench instance id to its docker image tag fragment.
+
+    SWE-bench publishes ``swebench/sweb.eval.x86_64.<tag>`` where ``<tag>`` is the
+    lower-cased instance id with ``__`` rewritten to ``_1776_`` (e.g.
+    ``astropy__astropy-12907`` -> ``astropy_1776_astropy-12907``). Gating on
+    ``__`` leaves non-SWE-bench ids untouched."""
+    return instance_id.replace("__", "_1776_").lower() if "__" in instance_id else instance_id
+
+
 def swebench_reward(test_output: str, metadata: dict[str, Any]) -> tuple[float, dict[str, Any]]:
     """Grade SWE-bench resolution from in-box test output (reuses swe_agents)."""
     from responses_api_agents.swe_agents.swe_bench_ext.utils import parse_and_check_tests
@@ -217,7 +227,7 @@ class SandboxCliAgent(SimpleResponsesAPIAgent):
 
     def _resolve_image(self, metadata: dict[str, Any]) -> Optional[str]:
         if self.config.image_template and metadata.get("instance_id"):
-            return self.config.image_template.format(instance_id=metadata["instance_id"])
+            return self.config.image_template.format(instance_id=swebench_image_tag(str(metadata["instance_id"])))
         return self.config.image
 
     def _sandbox_spec(self, metadata: dict[str, Any], proxy: Any) -> SandboxSpec:
