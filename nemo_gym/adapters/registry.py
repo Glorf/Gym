@@ -57,6 +57,10 @@ _BUILTIN: dict[str, str] = {
 # after the run; see ``nemo_gym.adapters.capture_store``.
 _BUILTIN["capture"] = "nemo_gym.adapters.interceptors.capture"
 
+# Translation family — adapt a foreign agent wire API to the policy's API, so a
+# harness like Claude Code (Anthropic Messages) runs against any OpenAI backend.
+_BUILTIN["translate_anthropic"] = "nemo_gym.adapters.interceptors.translate_anthropic"
+
 # External / plugin registrations at runtime.
 _EXTRA: dict[str, str] = {}
 

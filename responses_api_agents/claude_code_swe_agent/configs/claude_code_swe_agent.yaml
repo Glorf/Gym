@@ -1,0 +1,32 @@
+claude_code_swe_agent:
+  responses_api_agents:
+    claude_code_swe_agent:
+      entrypoint: app.py
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      model: claude-sonnet-4-5
+      concurrency: 8
+      timeout_s: 1800
+      max_turns: 30
+
+      sandbox:
+        name: ecs_fargate
+        # cluster / subnets / security_groups / role ARNs go here
+
+      image_template: "swebench/sweb.eval.x86_64.{instance_id}:latest"
+      image: null
+      workdir: /testbed
+
+      install_claude_in_box: true
+      claude_install_command: "npm install -g @anthropic-ai/claude-code@latest"
+      system_prompt: null
+      allowed_tools: null
+      disallowed_tools: null
+
+      capture_dir: outputs/claude_code_swe_agent/captures
+      proxy_host: 0.0.0.0
+      proxy_advertise_url: null
+      return_token_ids: true
+
+      eval_command: null

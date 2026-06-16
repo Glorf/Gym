@@ -1,0 +1,3 @@
+# The claude CLI is installed *inside the sandbox*
+# (npm i -g @anthropic-ai/claude-code) or baked into the task image.
+nemo-gym

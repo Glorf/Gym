@@ -66,6 +66,8 @@ def start_capture_proxy(
     advertise_url: str | None = None,
     inject_extra_body: dict[str, Any] | None = None,
     request_timeout: float = 600.0,
+    translate_anthropic: bool = False,
+    translate_model_override: str | None = None,
     extra_adapters: list[dict[str, Any]] | None = None,
 ) -> SandboxCaptureProxy:
     """Start a localhost proxy bound to ``session_id`` that captures model traffic.
@@ -73,8 +75,18 @@ def start_capture_proxy(
     ``host`` defaults to localhost; pass a routable bind address (with the
     underlying ``unsafe_allow_remote``) or set ``advertise_url`` when the sandbox
     reaches the proxy through a tunnel rather than the bind address directly.
+
+    Set ``translate_anthropic`` for agents that speak the Anthropic Messages API
+    (Claude Code): the translation runs *before* capture, so the recorded
+    exchange — and therefore the token-ids and trajectory — stays OpenAI-shaped,
+    while the agent still receives an Anthropic response.
     """
-    adapters: list[dict[str, Any]] = [
+    adapters: list[dict[str, Any]] = []
+    if translate_anthropic:
+        adapters.append(
+            {"name": "translate_anthropic", "config": {"model_override": translate_model_override}}
+        )
+    adapters.append(
         {
             "name": "capture",
             "config": {
@@ -83,7 +95,7 @@ def start_capture_proxy(
                 "inject_extra_body": inject_extra_body or {},
             },
         }
-    ]
+    )
     if extra_adapters:
         adapters.extend(extra_adapters)
 
