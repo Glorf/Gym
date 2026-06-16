@@ -30,6 +30,7 @@ a fork of ``run()``.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -123,24 +124,78 @@ def swebench_image_tag(instance_id: str) -> str:
     return instance_id.replace("__", "_1776_").lower() if "__" in instance_id else instance_id
 
 
-def swebench_reward(test_output: str, metadata: dict[str, Any]) -> tuple[float, dict[str, Any]]:
-    """Grade SWE-bench resolution from in-box test output (reuses swe_agents)."""
-    from responses_api_agents.swe_agents.swe_bench_ext.utils import parse_and_check_tests
+def _coerce_test_ids(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = json.loads(value) if value.strip().startswith("[") else [value]
+    return [str(v) for v in (value or [])]
 
-    fail_to_pass = metadata.get("fail_to_pass") or metadata.get("FAIL_TO_PASS") or []
-    pass_to_pass = metadata.get("pass_to_pass") or metadata.get("PASS_TO_PASS") or []
-    if isinstance(fail_to_pass, str):
-        fail_to_pass = json.loads(fail_to_pass)
-    if isinstance(pass_to_pass, str):
-        pass_to_pass = json.loads(pass_to_pass)
-    report = parse_and_check_tests(
-        test_output=test_output,
-        test_framework=metadata.get("test_framework") or "pytest",
-        fail_to_pass=list(fail_to_pass),
-        pass_to_pass=list(pass_to_pass),
-        instance_id=str(metadata.get("instance_id") or ""),
-    )
-    return (1.0 if report.get("resolved") else 0.0), report
+
+def swe_fields(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Normalize SWE-bench grading fields out of task metadata.
+
+    Datasets vary: the fields may be top-level (``test_patch``, ``FAIL_TO_PASS``)
+    or nested inside an ``instance_dict`` JSON blob. Top-level keys win."""
+    src: dict[str, Any] = {}
+    inst = metadata.get("instance_dict")
+    if isinstance(inst, str):
+        try:
+            src.update(json.loads(inst))
+        except (ValueError, TypeError):
+            pass
+    elif isinstance(inst, dict):
+        src.update(inst)
+    src.update(metadata)
+    return {
+        "test_patch": src.get("test_patch") or src.get("TEST_PATCH"),
+        "f2p": _coerce_test_ids(src.get("fail_to_pass") or src.get("FAIL_TO_PASS")),
+        "p2p": _coerce_test_ids(src.get("pass_to_pass") or src.get("PASS_TO_PASS")),
+    }
+
+
+def _node_status(test_output: str, nodeid: str) -> str:
+    """Status of one test from raw pytest output by *exact nodeid membership*.
+
+    The full nodeid (parametrization brackets included) appears verbatim in both
+    ``pytest -rA`` summary lines (``PASSED <nodeid>``) and ``pytest -v`` lines
+    (``<nodeid> PASSED [ 6%]``). Membership is robust to both orderings and to
+    parametrized ids, unlike a positional regex parser."""
+    for bad in ("FAILED", "ERROR"):
+        if f"{bad} {nodeid}" in test_output or f"{nodeid} {bad}" in test_output:
+            return "FAILED"
+    if f"PASSED {nodeid}" in test_output or f"{nodeid} PASSED" in test_output:
+        return "PASSED"
+    return "NOT_FOUND"
+
+
+def swebench_reward(test_output: str, metadata: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    """Grade SWE-bench resolution from raw in-box pytest output.
+
+    resolved == every FAIL_TO_PASS *and* every PASS_TO_PASS test is PASSED (and
+    there is at least one FAIL_TO_PASS), matching the SWE-bench definition.
+    Uses exact nodeid membership (see :func:`_node_status`) rather than the
+    swe_agents marker-script parser, which only understands that script's
+    structured output and mis-handles raw pytest text."""
+    fail_to_pass = _coerce_test_ids(metadata.get("fail_to_pass") or metadata.get("FAIL_TO_PASS"))
+    pass_to_pass = _coerce_test_ids(metadata.get("pass_to_pass") or metadata.get("PASS_TO_PASS"))
+
+    f2p_results = {tid: _node_status(test_output, tid) for tid in fail_to_pass}
+    p2p_results = {tid: _node_status(test_output, tid) for tid in pass_to_pass}
+
+    all_f2p = bool(f2p_results) and all(v == "PASSED" for v in f2p_results.values())
+    all_p2p = all(v == "PASSED" for v in p2p_results.values())  # empty P2P is vacuously satisfied
+    resolved = all_f2p and all_p2p
+
+    report = {
+        "resolved": resolved,
+        "fail_to_pass_results": f2p_results,
+        "pass_to_pass_results": p2p_results,
+        "f2p_passed": sum(1 for v in f2p_results.values() if v == "PASSED"),
+        "f2p_total": len(f2p_results),
+        "p2p_passed": sum(1 for v in p2p_results.values() if v == "PASSED"),
+        "p2p_total": len(p2p_results),
+        "framework": metadata.get("test_framework") or "pytest",
+    }
+    return (1.0 if resolved else 0.0), report
 
 
 class SandboxCliAgentConfig(BaseResponsesAPIAgentConfig):
@@ -167,7 +222,14 @@ class SandboxCliAgentConfig(BaseResponsesAPIAgentConfig):
     proxy_advertise_url: Optional[str] = None
     return_token_ids: bool = True
 
+    # Grading. If eval_command is set it wins (fully custom). Otherwise, when the
+    # task metadata carries SWE-bench fields (test_patch + FAIL_TO_PASS), the base
+    # builds an in-box grade: apply the test_patch, then run the F2P/P2P tests.
     eval_command: Optional[str] = None
+    apply_test_patch: bool = True
+    eval_conda_env: Optional[str] = "testbed"  # SWE-bench images ship a `testbed` env; None => skip activation
+    eval_conda_setup: str = "/opt/miniconda3/etc/profile.d/conda.sh"
+    eval_pytest_opts: str = "-rA -p no:cacheprovider"
 
 
 class SandboxCliAgentRunRequest(BaseRunRequest):
@@ -241,6 +303,35 @@ class SandboxCliAgent(SimpleResponsesAPIAgent):
             provider_options={"outside_endpoints": [{"url": url, "env_var": env_var}]},
         )
 
+    def _build_eval(self, metadata: dict[str, Any]) -> Optional[str]:
+        """In-box grade command for one rollout.
+
+        Explicit ``eval_command`` wins. Otherwise, when the task carries SWE-bench
+        fields, build: apply the gold ``test_patch`` on top of the agent's changes,
+        then run the FAIL_TO_PASS + PASS_TO_PASS tests (in the image's conda env).
+        Returns ``None`` when there is nothing to grade."""
+        if self.config.eval_command:
+            return self.config.eval_command
+        swe = swe_fields(metadata)
+        if not swe["f2p"]:  # a SWE-bench grade requires at least one FAIL_TO_PASS test
+            return None
+        parts: list[str] = []
+        if self.config.apply_test_patch and swe["test_patch"]:
+            b64 = base64.b64encode(swe["test_patch"].encode()).decode()
+            parts.append(
+                f"echo '{b64}' | base64 -d > /tmp/nemo_gym_test.patch && "
+                "git apply --reject --recount --ignore-whitespace /tmp/nemo_gym_test.patch || true"
+            )
+        ids = " ".join(shlex.quote(i) for i in (swe["f2p"] + swe["p2p"]))
+        run = f"python -m pytest {self.config.eval_pytest_opts} {ids}"
+        if self.config.eval_conda_env:
+            run = (
+                f"source {shlex.quote(self.config.eval_conda_setup)} && "
+                f"conda activate {shlex.quote(self.config.eval_conda_env)} && {run}"
+            )
+        parts.append(run)
+        return " ; ".join(parts)
+
     async def responses(self, body: NeMoGymResponseCreateParamsNonStreaming = Body()) -> NeMoGymResponse:
         raise NotImplementedError(f"{type(self).__name__} runs the full sandbox lifecycle in run().")
 
@@ -267,6 +358,7 @@ class SandboxCliAgent(SimpleResponsesAPIAgent):
         session_id = f"{self.session_prefix}-{uuid4().hex[:12]}"
         env_var, _with_v1, translate = self._wire()
         inject = {"return_token_id_information": True} if self.config.return_token_ids else {}
+        eval_cmd = self._build_eval(metadata)
 
         proxy = start_capture_proxy(
             model_base_url=self._resolve_base_url(),
@@ -320,9 +412,10 @@ class SandboxCliAgent(SimpleResponsesAPIAgent):
             )
             patch = patch_res.stdout or ""
 
-            if self.config.eval_command:
-                ev = await sandbox.exec(self.config.eval_command, cwd=self.config.workdir, timeout_s=self.config.timeout_s)
+            if eval_cmd:
+                ev = await sandbox.exec(eval_cmd, cwd=self.config.workdir, timeout_s=self.config.timeout_s)
                 test_output = (ev.stdout or "") + "\n" + (ev.stderr or "")
+                notes["eval_rc"] = ev.return_code
         finally:
             proxy.stop()
             await sandbox.stop()
@@ -336,8 +429,15 @@ class SandboxCliAgent(SimpleResponsesAPIAgent):
 
         reward = 0.0
         verify_fields: dict[str, Any] = {}
-        if self.config.eval_command and test_output.strip():
-            reward, verify_fields = swebench_reward(test_output, metadata)
+        if eval_cmd and test_output.strip():
+            swe = swe_fields(metadata)
+            grade_meta = {
+                "instance_id": metadata.get("instance_id"),
+                "FAIL_TO_PASS": swe["f2p"],
+                "PASS_TO_PASS": swe["p2p"],
+                "test_framework": metadata.get("test_framework"),
+            }
+            reward, verify_fields = swebench_reward(test_output, grade_meta)
 
         gym_resp = NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
