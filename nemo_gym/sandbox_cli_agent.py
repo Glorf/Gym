@@ -114,6 +114,28 @@ def extract_instruction(body_input: Any) -> tuple[str, Optional[str]]:
     return user_message, system_message
 
 
+def _assistant_turns(items: list[Any]) -> int:
+    return sum(
+        1
+        for it in items
+        if getattr(it, "type", None) == "message" and getattr(it, "role", None) == "assistant"
+    )
+
+
+def choose_trajectory(captured: list[Any], fallback: list[Any]) -> tuple[list[Any], bool]:
+    """Pick the better of the captured-wire trajectory and the CLI-stdout fallback.
+
+    Token-id-bearing captures are RL-grade and always win. Otherwise prefer
+    whichever has more assistant turns: streamed responses (e.g. codex) aren't
+    recorded as ``output``, so the capture can be degenerate (0 assistant turns)
+    while the CLI's own structured stdout carries the full trajectory."""
+    if has_token_ids(captured):
+        return captured, True
+    if captured and _assistant_turns(captured) >= _assistant_turns(fallback):
+        return captured, False
+    return fallback, False
+
+
 def swebench_image_tag(instance_id: str) -> str:
     """Map a SWE-bench instance id to its docker image tag fragment.
 
@@ -338,9 +360,7 @@ class SandboxCliAgent(SimpleResponsesAPIAgent):
     def _gather(self, session_id: str, stdout: str) -> tuple[list[Any], bool]:
         wire = "responses" if self.config.model_api == "responses" else "chat"
         captured = assemble_trajectory(CaptureStore(self.config.capture_dir).read(session_id), wire=wire)
-        if captured:
-            return captured, has_token_ids(captured)
-        return self.parse_stdout(stdout), False
+        return choose_trajectory(captured, self.parse_stdout(stdout))
 
     async def run(
         self,
@@ -406,8 +426,12 @@ class SandboxCliAgent(SimpleResponsesAPIAgent):
             if result.return_code != 0:
                 notes["agent_stderr"] = (result.stderr or "")[-800:]
 
+            # Exclude the agent's own config/home dir (e.g. .codex_swe_agent/) so the
+            # captured patch is the repo fix only, not CLI state (config.toml, sqlite).
+            cfg_basename = self.config_dir.rsplit("/", 1)[-1]
             patch_res = await sandbox.exec(
-                f"cd {shlex.quote(self.config.workdir)} && git add -A 2>/dev/null && git diff --cached",
+                f"cd {shlex.quote(self.config.workdir)} && git add -A 2>/dev/null && "
+                f"git reset -q -- {shlex.quote(cfg_basename)} 2>/dev/null; git diff --cached",
                 timeout_s=300,
             )
             patch = patch_res.stdout or ""

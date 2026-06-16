@@ -14,7 +14,35 @@
 # limitations under the License.
 """Unit tests for SandboxCliAgent pure helpers."""
 
-from nemo_gym.sandbox_cli_agent import swebench_image_tag, swebench_reward
+from types import SimpleNamespace
+
+from nemo_gym.sandbox_cli_agent import choose_trajectory, swebench_image_tag, swebench_reward
+
+
+def _asst(token_ids=None):
+    return SimpleNamespace(type="message", role="assistant", generation_token_ids=token_ids)
+
+
+def test_choose_trajectory_token_ids_capture_wins():
+    captured = [_asst(token_ids=[1, 2, 3])]
+    fallback = [_asst(), _asst()]
+    items, rl = choose_trajectory(captured, fallback)
+    assert items is captured and rl is True
+
+
+def test_choose_trajectory_prefers_fallback_when_capture_degenerate():
+    # streamed responses -> capture has 0 assistant turns -> use the richer stdout
+    captured = [SimpleNamespace(type="function_call_output", role=None, generation_token_ids=None)]
+    fallback = [_asst(), _asst()]
+    items, rl = choose_trajectory(captured, fallback)
+    assert items is fallback and rl is False
+
+
+def test_choose_trajectory_keeps_capture_when_at_least_as_rich():
+    captured = [_asst(), _asst()]
+    fallback = [_asst()]
+    items, rl = choose_trajectory(captured, fallback)
+    assert items is captured and rl is False
 
 
 def test_swebench_image_tag_rewrites_double_underscore_and_lowercases():
