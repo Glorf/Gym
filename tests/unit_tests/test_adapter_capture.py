@@ -147,3 +147,27 @@ def test_assemble_trajectory_tolerates_empty_and_malformed():
     assert assemble_trajectory([]) == []
     assert assemble_trajectory([{"request": {}, "response": {}}]) == []
     assert assemble_trajectory([{"response": {"choices": []}}]) == []
+
+
+def test_assemble_trajectory_responses_wire():
+    exchanges = [
+        {
+            "request": {"input": "fix it"},
+            "response": {
+                "output": [
+                    {"type": "reasoning", "content": []},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "on it"}],
+                        "generation_token_ids": [9, 8, 7],
+                    },
+                    {"type": "function_call", "id": "c1", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"},
+                ]
+            },
+        }
+    ]
+    items = assemble_trajectory(exchanges, wire="responses")
+    assert [it.type for it in items] == ["message", "function_call"]
+    assert items[0].generation_token_ids == [9, 8, 7]
+    assert items[1].name == "shell"

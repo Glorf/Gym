@@ -12,56 +12,155 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Claude Code as a sandbox-bound custom agent, runnable against *any* backend.
+"""Claude Code as a thin :class:`SandboxCliAgent` subclass, runnable against any backend.
 
-Claude Code speaks the Anthropic Messages API. This harness runs it **inside a
-Gym sandbox** with ``ANTHROPIC_BASE_URL`` pointed at a per-rollout capture proxy
-running in ``translate_anthropic`` mode, so Anthropic ``/v1/messages`` calls are
-translated to OpenAI Chat Completions for the Gym/vLLM model server (the "any
-backend" requirement) while the trajectory and token-ids are captured uniformly.
-
-``run()`` owns the lifecycle; verify reuses the SWE-bench parser in-box.
-
-NOTE: Claude Code streams by default; the proxy currently buffers (translation
-forces a non-streaming upstream call). SSE translation is the remaining piece for
-full streaming fidelity.
+Runs ``claude -p --output-format stream-json`` inside a Gym sandbox with
+``model_api="messages"``, so the base routes it through the ``translate_anthropic``
+interceptor (Anthropic Messages <-> OpenAI Chat) and Claude Code can run against
+an OpenAI-compatible backend. This module only knows how to launch claude and
+parse its Anthropic stream-json.
 """
 
 from __future__ import annotations
 
 import json
-import logging
-import shlex
-from time import time
 from typing import Any, Optional
+import shlex
 from uuid import uuid4
 
-from fastapi import Body, Request
-from pydantic import ConfigDict
-
-from nemo_gym.adapters.capture_store import CaptureStore, assemble_trajectory, has_token_ids
-from nemo_gym.adapters.sandbox_capture import start_capture_proxy
-from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
-from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, SimpleResponsesAPIAgent
-from nemo_gym.config_types import ModelServerRef
-from nemo_gym.global_config import get_first_server_config_dict
 from nemo_gym.openai_utils import (
-    NeMoGymEasyInputMessage,
-    NeMoGymResponse,
-    NeMoGymResponseCreateParamsNonStreaming,
-    NeMoGymResponseInputTokensDetails,
-    NeMoGymResponseOutputTokensDetails,
-    NeMoGymResponseUsage,
+    NeMoGymFunctionCallOutput,
+    NeMoGymResponseFunctionToolCall,
+    NeMoGymResponseOutputMessage,
+    NeMoGymResponseOutputText,
 )
-from nemo_gym.sandbox.api import AsyncSandbox
-from nemo_gym.sandbox.providers import SandboxSpec
-
-# Reuse the existing Claude stream-json parser and the shared SWE helpers.
-from responses_api_agents.claude_code_agent.app import parse_stream_json
-from responses_api_agents.codex_swe_agent.app import extract_instruction, swebench_reward
+from nemo_gym.sandbox_cli_agent import LaunchPlan, SandboxCliAgent, SandboxCliAgentConfig
 
 
-LOG = logging.getLogger(__name__)
+DEFAULT_CLAUDE_INSTALL = (
+    "set -e; command -v curl >/dev/null 2>&1 || "
+    "(apt-get update -qq && apt-get install -y -qq curl xz-utils >/dev/null 2>&1) || true; "
+    "if [ ! -x /opt/nodejs/bin/node ]; then mkdir -p /opt/nodejs && "
+    "curl -fsSL https://nodejs.org/dist/v22.15.0/node-v22.15.0-linux-x64.tar.xz "
+    "| tar -xJ --strip-components=1 -C /opt/nodejs; fi; "
+    "export PATH=/opt/nodejs/bin:$PATH; npm install -g @anthropic-ai/claude-code@latest"
+)
+
+
+def _extract_text(content: list[Any]) -> str:
+    return "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+
+
+def _extract_thinking(content: list[Any]) -> str:
+    parts = []
+    for b in content:
+        if isinstance(b, dict) and b.get("type") in ("thinking", "reasoning"):
+            parts.append(b.get("thinking") or b.get("text") or "")
+    return "\n".join(p for p in parts if p)
+
+
+def parse_stream_json(stdout: str) -> tuple[list[Any], dict]:
+    """Convert ``claude -p --output-format=stream-json`` stdout into (output_items, usage)."""
+    raw_events: list[dict] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            raw_events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    output_items: list[Any] = []
+    pending_calls: dict[str, dict] = {}
+    buffered_think: str | None = None
+    total_input = 0
+    total_output = 0
+
+    for event in raw_events:
+        etype = event.get("type")
+        if etype == "result":
+            usage = event.get("usage") or {}
+            total_input += int(usage.get("input_tokens") or 0)
+            total_output += int(usage.get("output_tokens") or 0)
+        elif etype == "assistant":
+            message = event.get("message", {})
+            content = message.get("content") or []
+            usage = message.get("usage") or {}
+            total_input += int(usage.get("input_tokens") or 0)
+            total_output += int(usage.get("output_tokens") or 0)
+            if not isinstance(content, list):
+                content = []
+            think = _extract_thinking(content)
+            if think:
+                buffered_think = (buffered_think + "\n" + think) if buffered_think else think
+            text = _extract_text(content)
+            if text:
+                if buffered_think:
+                    text = f"<think>\n{buffered_think}\n</think>\n\n{text}"
+                    buffered_think = None
+                output_items.append(
+                    NeMoGymResponseOutputMessage(
+                        id=f"msg-{len(output_items)}",
+                        content=[NeMoGymResponseOutputText(type="output_text", text=text, annotations=[])],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    )
+                )
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                call_id = block.get("id") or f"call-{uuid4().hex[:8]}"
+                input_data = block.get("input") or {}
+                arguments = json.dumps(input_data) if isinstance(input_data, dict) else str(input_data)
+                pending_calls[call_id] = {"name": block.get("name", ""), "call_id": call_id, "arguments": arguments}
+        elif etype == "user":
+            message = event.get("message", {})
+            content = message.get("content") or []
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_id = block.get("tool_use_id", "")
+                call_info = pending_calls.pop(tool_id, None)
+                if call_info:
+                    output_items.append(
+                        NeMoGymResponseFunctionToolCall(
+                            arguments=call_info["arguments"],
+                            call_id=tool_id,
+                            name=call_info["name"],
+                            type="function_call",
+                            id=tool_id,
+                            status="completed",
+                        )
+                    )
+                result_content = block.get("content") or ""
+                result_text = _extract_text(result_content) if isinstance(result_content, list) else str(result_content)
+                output_items.append(
+                    NeMoGymFunctionCallOutput(
+                        type="function_call_output",
+                        call_id=tool_id,
+                        output=result_text,
+                        status="completed",
+                    )
+                )
+
+    return output_items, {"input_tokens": total_input, "output_tokens": total_output}
+
+
+def claude_settings_json() -> str:
+    """Minimal Claude settings: telemetry/attribution off."""
+    return json.dumps(
+        {
+            "env": {
+                "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+                "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            }
+        }
+    )
 
 
 def claude_command(
@@ -97,242 +196,50 @@ def claude_command(
     return " ".join(parts)
 
 
-def claude_settings_json() -> str:
-    """Minimal Claude settings: telemetry/attribution off (matches the host agent)."""
-    return json.dumps(
-        {
-            "env": {
-                "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-                "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            }
-        }
-    )
-
-
-class ClaudeCodeSweAgentConfig(BaseResponsesAPIAgentConfig):
-    model_server: Optional[ModelServerRef] = None
-    model_base_url: Optional[str] = None
+class ClaudeCodeSweAgentConfig(SandboxCliAgentConfig):
     model: str = "claude-sonnet-4-5"
-    concurrency: int = 8
-    timeout_s: int = 1800
+    model_api: str = "messages"
     max_turns: int = 30
-
-    sandbox: dict[str, Any]
-    image: Optional[str] = None
-    image_template: Optional[str] = None
-    workdir: str = "/testbed"
-
-    install_claude_in_box: bool = True
-    node_bin_dir: str = "/opt/nodejs/bin"
-    claude_install_command: str = (
-        "set -e; command -v curl >/dev/null 2>&1 || "
-        "(apt-get update -qq && apt-get install -y -qq curl xz-utils >/dev/null 2>&1) || true; "
-        "if [ ! -x /opt/nodejs/bin/node ]; then mkdir -p /opt/nodejs && "
-        "curl -fsSL https://nodejs.org/dist/v22.15.0/node-v22.15.0-linux-x64.tar.xz "
-        "| tar -xJ --strip-components=1 -C /opt/nodejs; fi; "
-        "export PATH=/opt/nodejs/bin:$PATH; npm install -g @anthropic-ai/claude-code@latest"
-    )
-    model_api_key: str = ""  # pragma: allowlist secret — real upstream key (proxy injects it)
-    system_prompt: Optional[str] = None
+    claude_install_command: str = DEFAULT_CLAUDE_INSTALL
     allowed_tools: Optional[str] = None
     disallowed_tools: Optional[str] = None
 
-    capture_dir: str = "outputs/claude_code_swe_agent/captures"
-    proxy_host: str = "127.0.0.1"
-    proxy_advertise_url: Optional[str] = None
-    return_token_ids: bool = True
 
-    eval_command: Optional[str] = None
-
-
-class ClaudeCodeSweAgentRunRequest(BaseRunRequest):
-    model_config = ConfigDict(extra="allow")
-
-
-class ClaudeCodeSweAgentVerifyResponse(BaseVerifyResponse):
-    model_config = ConfigDict(extra="allow")
-    turns_used: int = 0
-    patch_exists: bool = False
-
-
-class ClaudeCodeSweAgent(SimpleResponsesAPIAgent):
+class ClaudeCodeSweAgent(SandboxCliAgent):
     config: ClaudeCodeSweAgentConfig
-    model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    def _resolve_base_url(self) -> str:
-        # Model ROOT (no /v1): the proxy forwards the agent's full path onto it.
-        if self.config.model_server:
-            cfg = get_first_server_config_dict(
-                self.server_client.global_config_dict,
-                self.config.model_server.name,
-            )
-            return self.server_client._build_server_base_url(cfg)
-        return (self.config.model_base_url or "").rstrip("/")
-
-    def _sandbox_spec(self, metadata: dict[str, Any], proxy: Any) -> SandboxSpec:
-        image = self.config.image
-        if self.config.image_template and metadata.get("instance_id"):
-            image = self.config.image_template.format(instance_id=metadata["instance_id"])
-        return SandboxSpec(
-            image=image,
-            workdir=self.config.workdir,
-            timeout_s=self.config.timeout_s,
-            metadata={"instance_id": str(metadata.get("instance_id") or "")},
-            # Claude appends /v1/messages, so the endpoint URL has no /v1; the
-            # translate interceptor rewrites it to /v1/chat/completions upstream.
-            provider_options={
-                "outside_endpoints": [{"url": proxy.handle.url, "env_var": "ANTHROPIC_BASE_URL"}]
-            },
-        )
-
-    async def responses(
-        self,
-        body: NeMoGymResponseCreateParamsNonStreaming = Body(),
-    ) -> NeMoGymResponse:
-        raise NotImplementedError(
-            "ClaudeCodeSweAgent runs the full sandbox lifecycle in run(); it has no standalone responses() episode."
-        )
-
-    async def _gather_trajectory(self, session_id: str, claude_stdout: str) -> tuple[list[Any], bool]:
-        """Prefer the captured (OpenAI-shaped) trajectory carrying generation_token_ids;
-        fall back to Claude's Anthropic stream-json when nothing was captured."""
-        exchanges = CaptureStore(self.config.capture_dir).read(session_id)
-        captured = assemble_trajectory(exchanges)
-        if captured:
-            return captured, has_token_ids(captured)
-        parsed, _usage = parse_stream_json(claude_stdout)
-        return parsed, False
-
-    async def run(
-        self,
-        request: Request,
-        body: ClaudeCodeSweAgentRunRequest = Body(),
-    ) -> ClaudeCodeSweAgentVerifyResponse:
-        params = body.responses_create_params
-        metadata = dict(getattr(params, "metadata", None) or {})
-        body_input = getattr(params, "input", None)
-        if isinstance(body_input, str):
-            body_input = [NeMoGymEasyInputMessage(role="user", content=body_input)]
-        user_message, input_system = extract_instruction(body_input)
-        system_prompt = "\n\n".join(p for p in [self.config.system_prompt, input_system] if p) or None
-
-        session_id = f"claude-{uuid4().hex[:12]}"
-        config_dir = f"{self.config.workdir.rstrip('/')}/.claude"
-        base_url = self._resolve_base_url()
-        inject = {"return_token_id_information": True} if self.config.return_token_ids else {}
-
-        # translate_anthropic: Claude's /v1/messages -> OpenAI chat for any backend.
-        proxy = start_capture_proxy(
-            model_base_url=base_url,
-            session_id=session_id,
-            store_dir=self.config.capture_dir,
-            host=self.config.proxy_host,
-            advertise_url=self.config.proxy_advertise_url,
-            inject_extra_body=inject,
-            upstream_api_key=self.config.model_api_key or None,
-            request_timeout=float(self.config.timeout_s),
-            translate_anthropic=True,
-            translate_model_override=self.config.model,
-        )
-
-        sandbox = AsyncSandbox(self.config.sandbox, self._sandbox_spec(metadata, proxy), delete_on_stop=True)
-        claude_stdout = ""
-        patch = ""
-        test_output = ""
-        try:
-            await sandbox.start()
-
-            box_base_url = sandbox.resolved_endpoint_url("ANTHROPIC_BASE_URL") or proxy.sandbox_base_url
-            path_prefix = f"export PATH={shlex.quote(self.config.node_bin_dir)}:$PATH"
-            box_env = {
-                "ANTHROPIC_API_KEY": "dummy-key",  # pragma: allowlist secret — proxy injects the real key
-                "ANTHROPIC_AUTH_TOKEN": "local",  # pragma: allowlist secret
-                "ANTHROPIC_BASE_URL": box_base_url,
-                "ANTHROPIC_MODEL": self.config.model,
-                "IS_SANDBOX": "1",
-                "CLAUDE_CONFIG_DIR": config_dir,
-            }
-            await sandbox.exec(f"mkdir -p {shlex.quote(config_dir)}")
-            await sandbox.exec(
-                f"cat > {shlex.quote(config_dir + '/settings.json')} <<'EOF'\n{claude_settings_json()}\nEOF"
-            )
-            if self.config.install_claude_in_box:
-                install = await sandbox.exec(self.config.claude_install_command, timeout_s=self.config.timeout_s)
-                if install.return_code != 0:
-                    LOG.warning("claude install in box returned %s: %s", install.return_code, install.stderr)
-
-            cmd = claude_command(
-                prompt=user_message,
-                model=self.config.model,
-                max_turns=self.config.max_turns,
-                system_prompt=system_prompt,
-                allowed_tools=self.config.allowed_tools,
-                disallowed_tools=self.config.disallowed_tools,
-            )
-            result = await sandbox.exec(
-                f"{path_prefix} && {cmd}", cwd=self.config.workdir, env=box_env, timeout_s=self.config.timeout_s
-            )
-            claude_stdout = result.stdout or ""
-
-            patch_res = await sandbox.exec(
-                f"cd {shlex.quote(self.config.workdir)} && git add -A && git diff --cached",
-                timeout_s=300,
-            )
-            patch = patch_res.stdout or ""
-
-            if self.config.eval_command:
-                eval_res = await sandbox.exec(self.config.eval_command, cwd=self.config.workdir, timeout_s=self.config.timeout_s)
-                test_output = (eval_res.stdout or "") + "\n" + (eval_res.stderr or "")
-        finally:
-            proxy.stop()
-            await sandbox.stop()
-
-        output_items, rl_ready = await self._gather_trajectory(session_id, claude_stdout)
-        turns = sum(
-            1
-            for item in output_items
-            if getattr(item, "type", None) == "message" and getattr(item, "role", None) == "assistant"
-        )
-
-        reward = 0.0
-        verify_fields: dict[str, Any] = {}
-        if self.config.eval_command and test_output.strip():
-            reward, verify_fields = swebench_reward(test_output, metadata)
-
-        gym_resp = NeMoGymResponse(
-            id=f"resp_{uuid4().hex}",
-            created_at=int(time()),
+    def build_launch(self, *, box_base_url, prompt, system_prompt, workdir, config_dir) -> LaunchPlan:
+        setup = [
+            f"mkdir -p {shlex.quote(config_dir)}",
+            f"cat > {shlex.quote(config_dir + '/settings.json')} <<'EOF'\n{claude_settings_json()}\nEOF",
+        ]
+        cmd = claude_command(
+            prompt=prompt,
             model=self.config.model,
-            object="response",
-            output=output_items,
-            tool_choice=getattr(params, "tool_choice", None),
-            tools=getattr(params, "tools", None),
-            parallel_tool_calls=getattr(params, "parallel_tool_calls", None),
-            usage=NeMoGymResponseUsage(
-                input_tokens=0,
-                input_tokens_details=NeMoGymResponseInputTokensDetails(cached_tokens=0),
-                output_tokens=0,
-                output_tokens_details=NeMoGymResponseOutputTokensDetails(reasoning_tokens=0),
-                total_tokens=0,
-            ),
-            metadata={
-                "instance_id": str(metadata.get("instance_id") or ""),
-                "patch": patch,
-                "session_id": session_id,
-                "rl_token_ids": str(rl_ready).lower(),
-            }
-            | {k: str(v) for k, v in verify_fields.items()},
+            max_turns=self.config.max_turns,
+            system_prompt=system_prompt,
+            allowed_tools=self.config.allowed_tools,
+            disallowed_tools=self.config.disallowed_tools,
+        )
+        env = {
+            "ANTHROPIC_API_KEY": "dummy-key",  # pragma: allowlist secret — proxy injects the real key
+            "ANTHROPIC_AUTH_TOKEN": "local",  # pragma: allowlist secret
+            "ANTHROPIC_BASE_URL": box_base_url,
+            "ANTHROPIC_MODEL": self.config.model,
+            "IS_SANDBOX": "1",
+            "CLAUDE_CONFIG_DIR": config_dir,
+        }
+        return LaunchPlan(
+            run_command=cmd,
+            env=env,
+            setup_commands=setup,
+            install_command=self.config.claude_install_command,
+            path_prepend=self.config.node_bin_dir,
         )
 
-        return ClaudeCodeSweAgentVerifyResponse(
-            responses_create_params=params,
-            response=gym_resp,
-            reward=reward,
-            turns_used=turns,
-            patch_exists=bool(patch.strip()),
-            **verify_fields,
-        )
+    def parse_stdout(self, stdout: str) -> list[Any]:
+        items, _usage = parse_stream_json(stdout)
+        return items
 
 
 if __name__ == "__main__":

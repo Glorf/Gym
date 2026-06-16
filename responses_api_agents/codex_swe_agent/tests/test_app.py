@@ -16,13 +16,8 @@
 
 import json
 
-from responses_api_agents.codex_swe_agent.app import (
-    codex_command,
-    codex_config_toml,
-    extract_instruction,
-    parse_codex_jsonl,
-    swebench_reward,
-)
+from nemo_gym.sandbox_cli_agent import extract_instruction, swebench_reward
+from responses_api_agents.codex_swe_agent.app import codex_command, codex_config_toml, parse_codex_jsonl
 
 
 def test_parse_codex_jsonl_message_and_tool():

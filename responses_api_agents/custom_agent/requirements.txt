@@ -1,0 +1,2 @@
+# The agent's own CLI is installed in-box via the manifest install_command.
+nemo-gym

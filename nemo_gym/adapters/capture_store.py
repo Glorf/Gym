@@ -124,15 +124,23 @@ def _content_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def assemble_trajectory(exchanges: list[dict[str, Any]]) -> list[Any]:
-    """Reconstruct ordered NeMoGym output items from chat-completions exchanges.
+def assemble_trajectory(exchanges: list[dict[str, Any]], wire: str = "chat") -> list[Any]:
+    """Reconstruct ordered NeMoGym output items from captured model exchanges.
 
-    Each exchange is ``{"request": <body>, "response": <body>, ...}``. A turn's
-    tool *results* arrive as ``role: tool`` messages in the *next* request, so we
-    emit them just before the assistant message that follows, yielding the
-    natural ``assistant -> tool_output -> assistant`` interleave. Assistant
-    messages carry token-ids/logprobs when the policy returned them.
+    ``wire`` selects how the captured request/response bodies are shaped:
+    ``"chat"`` (OpenAI Chat Completions / the Anthropic-translated path) or
+    ``"responses"`` (OpenAI Responses API, e.g. codex). Assistant messages carry
+    token-ids/logprobs when the policy returned them.
     """
+    if wire == "responses":
+        return _assemble_responses(exchanges)
+    return _assemble_chat(exchanges)
+
+
+def _assemble_chat(exchanges: list[dict[str, Any]]) -> list[Any]:
+    """Chat-Completions wire: a turn's tool *results* arrive as ``role: tool``
+    messages in the *next* request, emitted just before the following assistant
+    message to yield the natural ``assistant -> tool_output -> assistant`` order."""
     output: list[Any] = []
     seen_tool_call_ids: set[str] = set()
     assistant_index = 0
@@ -196,6 +204,52 @@ def assemble_trajectory(exchanges: list[dict[str, Any]]) -> list[Any]:
                 )
             )
 
+    return output
+
+
+def _assemble_responses(exchanges: list[dict[str, Any]]) -> list[Any]:
+    """Responses-API wire: each response carries an ``output`` list of items
+    (``message`` / ``reasoning`` / ``function_call``); token-ids ride on the
+    assistant ``message`` item when the policy is a Gym model."""
+    output: list[Any] = []
+    assistant_index = 0
+    for exchange in exchanges:
+        response = exchange.get("response") or {}
+        for item in response.get("output") or []:
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("type")
+            if kind == "message" and item.get("role") == "assistant":
+                text = "".join(
+                    block.get("text", "")
+                    for block in (item.get("content") or [])
+                    if isinstance(block, dict) and block.get("type") == "output_text"
+                )
+                fields = {**_token_fields(item)}
+                output.append(
+                    NeMoGymResponseOutputMessageForTraining(
+                        id=f"msg-{assistant_index}",
+                        content=[NeMoGymResponseOutputText(type="output_text", text=text, annotations=[])],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                        prompt_token_ids=fields.get("prompt_token_ids") or [],
+                        generation_token_ids=fields.get("generation_token_ids") or [],
+                        generation_log_probs=fields.get("generation_log_probs") or [],
+                    )
+                )
+                assistant_index += 1
+            elif kind in ("function_call", "tool_call"):
+                output.append(
+                    NeMoGymResponseFunctionToolCall(
+                        arguments=item.get("arguments", "") or "",
+                        call_id=item.get("call_id") or item.get("id") or "",
+                        name=item.get("name", ""),
+                        type="function_call",
+                        id=item.get("id"),
+                        status="completed",
+                    )
+                )
     return output
 
 

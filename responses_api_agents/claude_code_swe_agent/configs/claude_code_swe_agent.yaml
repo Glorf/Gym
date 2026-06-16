@@ -2,28 +2,24 @@ claude_code_swe_agent:
   responses_api_agents:
     claude_code_swe_agent:
       entrypoint: app.py
-      model_server:
-        type: responses_api_models
-        name: policy_model
+      # Model ROOT (no /v1); Claude's /v1/messages is translated to /v1/chat/completions.
+      model_base_url: ${policy_base_url}
       model: claude-sonnet-4-5
+      model_api: messages
+      model_api_key_env: NEMO_GYM_MODEL_API_KEY
       concurrency: 8
       timeout_s: 1800
       max_turns: 30
 
       sandbox:
-        name: ecs_fargate
-        # cluster / subnets / security_groups / role ARNs go here
+        ecs_fargate:
+          region: us-east-1
 
       image_template: "swebench/sweb.eval.x86_64.{instance_id}:latest"
       image: null
       workdir: /testbed
 
-      install_claude_in_box: true
-      claude_install_command: "npm install -g @anthropic-ai/claude-code@latest"
-      system_prompt: null
-      allowed_tools: null
-      disallowed_tools: null
-
+      install_in_box: true
       capture_dir: outputs/claude_code_swe_agent/captures
       proxy_host: 0.0.0.0
       proxy_advertise_url: null
