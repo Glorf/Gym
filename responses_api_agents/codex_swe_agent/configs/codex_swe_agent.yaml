@@ -1,0 +1,41 @@
+codex_swe_agent:
+  responses_api_agents:
+    codex_swe_agent:
+      entrypoint: app.py
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      model: gpt-5-codex
+      concurrency: 8
+      timeout_s: 1800
+
+      # Sandbox provider config (passed to nemo_gym.sandbox create_provider).
+      # Fill in the ECS Fargate options for your account/cluster.
+      sandbox:
+        name: ecs_fargate
+        # cluster: ...
+        # subnets: [...]
+        # security_groups: [...]
+        # execution_role_arn: ...
+        # task_role_arn: ...
+
+      # SWE-bench uses a per-instance image; resolved from the task instance_id.
+      image_template: "swebench/sweb.eval.x86_64.{instance_id}:latest"
+      image: null
+      workdir: /testbed
+
+      # codex lives in the box
+      install_codex_in_box: true
+      codex_install_command: "npm install -g @openai/codex@latest"
+      codex_sandbox_mode: workspace-write
+      skip_git_repo_check: true
+      system_prompt: null
+
+      # sandbox-bound capture proxy
+      capture_dir: outputs/codex_swe_agent/captures
+      proxy_host: 0.0.0.0
+      proxy_advertise_url: null  # set when the box reaches the proxy via a tunnel
+      return_token_ids: true
+
+      # in-box SWE-bench verify; supply the instance test command (or set per task)
+      eval_command: null

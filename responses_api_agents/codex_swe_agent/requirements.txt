@@ -1,0 +1,3 @@
+# The codex CLI is installed *inside the sandbox* (npm i -g @openai/codex) or
+# baked into the task image, so it is not a host dependency here.
+nemo-gym

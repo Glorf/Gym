@@ -1,0 +1,1 @@
+{"responses_create_params": {"input": [{"role": "user", "content": "Resolve the failing tests described in the repository issue by editing the source under /testbed."}], "metadata": {"instance_id": "example__demo-0001", "fail_to_pass": ["tests/test_demo.py::test_fixed"], "pass_to_pass": ["tests/test_demo.py::test_unchanged"], "test_framework": "pytest"}}}
