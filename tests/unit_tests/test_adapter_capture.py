@@ -149,7 +149,7 @@ def test_assemble_trajectory_tolerates_empty_and_malformed():
     assert assemble_trajectory([{"response": {"choices": []}}]) == []
 
 
-def test_assemble_trajectory_responses_wire():
+def test_assemble_trajectory_responses_wire_interleaves_tool_outputs():
     exchanges = [
         {
             "request": {"input": "fix it"},
@@ -162,12 +162,27 @@ def test_assemble_trajectory_responses_wire():
                         "content": [{"type": "output_text", "text": "on it"}],
                         "generation_token_ids": [9, 8, 7],
                     },
-                    {"type": "function_call", "id": "c1", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"},
+                    {"type": "function_call", "id": "c1", "call_id": "c1", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"},
                 ]
             },
-        }
+        },
+        {
+            # the tool result of c1 arrives in the next request's input
+            "request": {
+                "input": [
+                    {"type": "function_call_output", "call_id": "c1", "output": "file.py"},
+                ]
+            },
+            "response": {
+                "output": [
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+                ]
+            },
+        },
     ]
     items = assemble_trajectory(exchanges, wire="responses")
-    assert [it.type for it in items] == ["message", "function_call"]
+    assert [it.type for it in items] == ["message", "function_call", "function_call_output", "message"]
     assert items[0].generation_token_ids == [9, 8, 7]
     assert items[1].name == "shell"
+    assert items[2].call_id == "c1"
+    assert items[2].output == "file.py"

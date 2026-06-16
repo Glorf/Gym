@@ -210,10 +210,35 @@ def _assemble_chat(exchanges: list[dict[str, Any]]) -> list[Any]:
 def _assemble_responses(exchanges: list[dict[str, Any]]) -> list[Any]:
     """Responses-API wire: each response carries an ``output`` list of items
     (``message`` / ``reasoning`` / ``function_call``); token-ids ride on the
-    assistant ``message`` item when the policy is a Gym model."""
+    assistant ``message`` item when the policy is a Gym model. A turn's tool
+    *results* arrive as ``function_call_output`` items in the *next* request's
+    ``input``, so we emit those just before that turn's response — yielding the
+    natural ``assistant -> function_call -> function_call_output -> assistant``
+    interleave (mirrors the chat-wire assembler)."""
     output: list[Any] = []
     assistant_index = 0
+    seen_output_call_ids: set[str] = set()
     for exchange in exchanges:
+        request = exchange.get("request") or {}
+        request_input = request.get("input")
+        if isinstance(request_input, list):
+            for item in request_input:
+                if not isinstance(item, dict) or item.get("type") != "function_call_output":
+                    continue
+                call_id = item.get("call_id") or item.get("id") or ""
+                if call_id and call_id in seen_output_call_ids:
+                    continue
+                if call_id:
+                    seen_output_call_ids.add(call_id)
+                output.append(
+                    NeMoGymFunctionCallOutput(
+                        type="function_call_output",
+                        call_id=call_id,
+                        output=_content_text(item.get("output")),
+                        status="completed",
+                    )
+                )
+
         response = exchange.get("response") or {}
         for item in response.get("output") or []:
             if not isinstance(item, dict):
