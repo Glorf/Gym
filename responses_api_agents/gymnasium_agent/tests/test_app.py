@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nemo_gym.agent_execution_capture import AgentExecutionRecorder
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
 from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
 from nemo_gym.server_utils import ServerClient
@@ -129,6 +130,81 @@ class TestConfig:
 
 
 class TestRun:
+    @pytest.mark.asyncio
+    async def test_parallel_calls_are_one_opaque_batch_span(self):
+        agent = _make_agent(max_steps=1)
+        recorder = AgentExecutionRecorder(
+            "4-2",
+            "test_gymnasium_agent",
+            agent.agent_execution_coverage(),
+            clock=iter([200, 290]).__next__,
+            clock_id="test-clock",
+        )
+        model_response = _model_response("")
+        model_response["id"] = "resp-parallel"
+        model_response["output"] = [
+            {"type": "function_call", "call_id": "call-a", "name": "a", "arguments": "{}"},
+            {"type": "function_call", "call_id": "call-b", "name": "b", "arguments": "{}"},
+        ]
+        _wire_mock_client(
+            agent,
+            {
+                "/reset": [{"observation": "go", "info": {}}],
+                "/v1/responses": [model_response],
+                "/step": [{"observation": None, "reward": 1.0, "terminated": True, "truncated": False, "info": {}}],
+            },
+        )
+        request = MagicMock(cookies={})
+        body = GymnasiumAgentRunRequest(responses_create_params={"input": [{"role": "user", "content": "play"}]})
+
+        with patch.object(GymnasiumAgent, "agent_execution_recorder_for_run", return_value=recorder):
+            await agent.run(request, body)
+
+        assert agent.agent_execution_coverage().model_dump() == {
+            "lineage": "partial",
+            "model_call_attribution": "partial",
+            "tool_timing": "partial",
+        }
+        capture = recorder.capture()
+        assert [(link.model_server, link.response_id) for link in capture.model_call_links] == [
+            ("policy_model", "resp-parallel")
+        ]
+        span = capture.tool_spans[0]
+        assert (span.tool_call_ids, span.granularity, span.measurement_scope) == (
+            ["call-a", "call-b"],
+            "batch",
+            "opaque_environment_step",
+        )
+        assert (span.started_ns, span.ended_ns, span.status, span.clock_id) == (200, 290, "returned", "test-clock")
+        assert (span.model_server, span.model_response_id) == ("policy_model", "resp-parallel")
+
+    @pytest.mark.asyncio
+    async def test_text_only_step_does_not_emit_tool_span(self):
+        agent = _make_agent(max_steps=1)
+        recorder = AgentExecutionRecorder(
+            "4-2",
+            "test_gymnasium_agent",
+            agent.agent_execution_coverage(),
+            clock=lambda: 1,
+        )
+        _wire_mock_client(
+            agent,
+            {
+                "/reset": [{"observation": "go", "info": {}}],
+                "/v1/responses": [_model_response("move")],
+                "/step": [{"observation": None, "reward": 1.0, "terminated": True, "truncated": False, "info": {}}],
+            },
+        )
+        request = MagicMock(cookies={})
+        body = GymnasiumAgentRunRequest(responses_create_params={"input": [{"role": "user", "content": "play"}]})
+
+        with patch.object(GymnasiumAgent, "agent_execution_recorder_for_run", return_value=recorder):
+            await agent.run(request, body)
+
+        capture = recorder.capture()
+        assert capture.tool_spans == []
+        assert [link.response_id for link in capture.model_call_links] == ["r"]
+
     @pytest.mark.asyncio
     async def test_terminates_on_first_step(self):
         agent = _make_agent()

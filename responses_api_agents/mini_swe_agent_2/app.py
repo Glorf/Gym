@@ -20,6 +20,7 @@ import sys
 import time
 import traceback
 from asyncio import Semaphore
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, cast
@@ -31,6 +32,10 @@ from fastapi import Body, FastAPI
 from minisweagent.config import builtin_config_dir, get_config_path
 from pydantic import ConfigDict
 
+from nemo_gym.agent_execution_capture import (
+    AgentExecutionCoverage,
+    AgentExecutionRecorder,
+)
 from nemo_gym.base_resources_server import (
     BaseRunRequest,
     BaseVerifyRequest,
@@ -56,6 +61,12 @@ from nemo_gym.server_utils import (
 
 OPENSANDBOX_PROVIDER_NAME = "opensandbox"
 OPENSANDBOX_API_KEY_ENV = "OPENSANDBOX_API_KEY"  # pragma: allowlist secret
+
+MINI_SWE_EXECUTION_COVERAGE = AgentExecutionCoverage(
+    lineage="partial",
+    model_call_attribution="partial",
+    tool_timing="exact",
+)
 
 
 class MiniSWEAgentConfig(BaseResponsesAPIAgentConfig):
@@ -313,6 +324,23 @@ def _split_trajectory_for_responses(
     return input_messages, output_items, raw_responses
 
 
+def _model_response_ids_from_trajectory(messages: list[dict[str, Any]]) -> list[str]:
+    """Return policy response IDs retained by MiniSWE's LiteLLM trajectory."""
+    response_ids: list[str] = []
+    seen: set[str] = set()
+    for message in messages:
+        extra = message.get("extra")
+        response = extra.get("response") if isinstance(extra, dict) else None
+        response_id = response.get("id") if isinstance(response, dict) else None
+        if response_id is None:
+            continue
+        response_id = str(response_id)
+        if response_id not in seen:
+            seen.add(response_id)
+            response_ids.append(response_id)
+    return response_ids
+
+
 def _default_response_object() -> dict[str, Any]:
     return {
         "id": f"resp_{str(uuid4())}",
@@ -528,12 +556,26 @@ def _run_mini_swe_v2(**params: Any) -> dict[str, Any]:
     run_id = f"{int(time.time())}_{uuid4()}"
     trajectory_path = instance_dir / f"{instance_id}_{run_id}.traj.json"
     agent_config["output_path"] = trajectory_path
+    capture_config = params.get("agent_execution_capture") or {}
+    execution_recorder = None
+    if capture_config:
+        rollout_id = capture_config.get("rollout_id")
+        agent_server = capture_config.get("agent_server")
+        if not rollout_id or not agent_server:
+            raise ValueError("agent execution capture requires rollout_id and agent_server")
+        execution_recorder = AgentExecutionRecorder(
+            rollout_id=str(rollout_id),
+            agent_server=str(agent_server),
+            coverage=MINI_SWE_EXECUTION_COVERAGE,
+        )
+
     env = None
-    agent = None
     try:
         print(f"[EVAL]{instance_id} Creating environment...", flush=True)
         env = get_environment(environment_config)
         print(f"[EVAL]{instance_id} Environment created", flush=True)
+        if execution_recorder is not None:
+            env.set_agent_execution_recorder(execution_recorder)
 
         model = get_model(config=model_config)
         agent = DefaultAgent(model, env, **agent_config)
@@ -544,13 +586,22 @@ def _run_mini_swe_v2(**params: Any) -> dict[str, Any]:
             data = agent.save(None, {"messages": []})
         else:
             print(f"[EVAL]{instance_id} Running mini-swe-agent v2...", flush=True)
-            info = agent.run(instance["problem_statement"])
+            capture_context = env.capture_agent_commands() if execution_recorder is not None else nullcontext()
+            with capture_context:
+                info = agent.run(instance["problem_statement"])
             exit_status = info.get("exit_status", "")
             model_patch = info.get("submission", "")
             data = agent.save(
                 trajectory_path,
                 {"instance_id": instance_id},
             )
+
+        if execution_recorder is not None:
+            for response_id in _model_response_ids_from_trajectory(data.get("messages", [])):
+                execution_recorder.add_model_call_link(
+                    response_id=response_id,
+                    model_server=capture_config.get("model_server"),
+                )
 
         print(f"[EVAL]{instance_id} Running eval", flush=True)
         eval_report = _run_eval_v2(
@@ -564,16 +615,16 @@ def _run_mini_swe_v2(**params: Any) -> dict[str, Any]:
         print(f"[EVAL]{instance_id} Eval completed", flush=True)
 
         input_messages, response_output, responses = _split_trajectory_for_responses(data.get("messages", []))
-
-        return {
-            instance_id: {
-                "input_messages": input_messages,
-                "response_output": response_output,
-                "responses": responses,
-                "eval_report": eval_report,
-                "exit_status": exit_status,
-            }
+        rollout_result = {
+            "input_messages": input_messages,
+            "response_output": response_output,
+            "responses": responses,
+            "eval_report": eval_report,
+            "exit_status": exit_status,
         }
+        if execution_recorder is not None:
+            rollout_result["agent_execution_capture"] = execution_recorder.capture().model_dump()
+        return {instance_id: rollout_result}
     finally:
         if env and hasattr(env, "cleanup"):
             env.cleanup()
@@ -591,11 +642,17 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
     def model_post_init(self, __context: Any) -> None:
         self.sem = Semaphore(self.config.concurrency)
 
+    def agent_execution_coverage(self) -> AgentExecutionCoverage:
+        return MINI_SWE_EXECUTION_COVERAGE
+
     def setup_webserver(self) -> FastAPI:
         app = FastAPI()
         self.setup_session_middleware(app)
         app.post("/v1/responses")(self.responses)
-        app.post("/run")(self.run)
+        run_handler = self.run
+        if self._agent_execution_store() is not None:
+            run_handler = self._run_with_agent_execution_capture(run_handler)
+        app.post("/run")(run_handler)
         app.post("/aggregate_metrics")(self.aggregate_metrics)
         return app
 
@@ -700,6 +757,7 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
     async def run(self, body: MiniSWEAgentRunRequest) -> MiniSWEAgentVerifyResponse:
         async with self.sem:
             model_server_name = self.config.model_server.name
+            owner_recorder = self.agent_execution_recorder_for_run(body)
             global_config_dict = ServerClient.load_from_global_config().global_config_dict
 
             model_server_config = get_first_server_config_dict(
@@ -777,6 +835,8 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
                     with open(f"{output_file_dir}/{instance_id}/{instance_id}.json", "r") as f:
                         print(f"Skipping {instance_id} because it already exists")
                         verify_response = MiniSWEAgentVerifyResponse.model_validate_json(f.read())
+                    if owner_recorder is not None:
+                        owner_recorder.mark_incomplete("mini_swe_cached_result_has_no_execution_evidence")
                     return verify_response
 
             #### RUN MINI-SWE-AGENT #####
@@ -800,6 +860,12 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
                     eval_timeout=eval_timeout,
                     step_limit=step_limit,
                 )
+                if owner_recorder is not None:
+                    params["agent_execution_capture"] = {
+                        "rollout_id": owner_recorder.rollout_id,
+                        "agent_server": self.config.name,
+                        "model_server": model_server_name,
+                    }
                 runner = runner_ray_remote
                 runtime_env = _sandbox_runtime_env(resolved_sandbox_provider)
                 if runtime_env.get("env_vars"):
@@ -807,12 +873,17 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
                 future = runner.remote(run_mini_swe_with_sandbox, params)
                 result = await asyncio.to_thread(ray.get, future)
                 result = result[instance_id]
+                worker_capture = result.pop("agent_execution_capture", None)
+                if worker_capture is not None:
+                    self.adopt_agent_execution_capture(body, worker_capture)
                 input_messages = result["input_messages"]
                 response_output = result["response_output"]
                 responses = result["responses"]
                 reward = 1.0 if _is_resolved(instance_id, result["eval_report"]) else 0.0
 
             except Exception as e:
+                if owner_recorder is not None:
+                    owner_recorder.mark_incomplete("mini_swe_worker_capture_unavailable")
                 error_info = {"error": str(e), "traceback": traceback.format_exc()}
                 print(f"Error running mini-swe-agent: {e}\n{error_info['traceback']}", flush=True)
                 result = {"eval_report": error_info}

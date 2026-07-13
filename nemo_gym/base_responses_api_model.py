@@ -391,8 +391,10 @@ class ModelCallRecord(BaseModel):
     # Durable append order, not a causal or semantic order for concurrent calls.
     call_index: int
     model_server: Optional[str] = None
+    model: Optional[str] = None
     dialect: Optional[str] = None
     status_code: Optional[int] = None
+    response_id: Optional[str] = None
 
     # Token accounting. tokens_reasoning is OpenAI/Responses-only
     # (sourced from *_tokens_details.reasoning_tokens); Anthropic does not expose it, so it is null
@@ -426,6 +428,7 @@ class ModelCallRecord(BaseModel):
 
 def build_model_call_record(exchange: dict[str, Any], *, call_index: int) -> ModelCallRecord:
     """Map one captured exchange and its transport metadata into an observability record."""
+    request = exchange.get("request")
     response = exchange.get("response") or {}
     tokens = extract_token_stats(response.get("usage"))
     cache_hit, cached_tokens = _cache_signal(response.get("usage"))
@@ -433,9 +436,11 @@ def build_model_call_record(exchange: dict[str, Any], *, call_index: int) -> Mod
     return ModelCallRecord(
         call_index=call_index,
         model_server=exchange.get("model_server"),
+        model=response.get("model") or (request or {}).get("model"),
         dialect=exchange.get("dialect"),
         status_code=exchange.get("status_code"),
-        request=exchange.get("request"),
+        response_id=response.get("id"),
+        request=request,
         response=response or None,
         tool_calls=tool_calls,
         reasoning_content=reasoning_content,
@@ -651,11 +656,13 @@ def _reconstruct_chat_sse(events: list[dict[str, Any]]) -> Optional[dict[str, An
     reasoning_parts: list[str] = []
     tool_calls: dict[int, dict[str, Any]] = {}
     usage: Optional[dict[str, Any]] = None
+    response_id: Optional[str] = None
     model: Optional[str] = None
     role = "assistant"
     finish_reason: Optional[str] = None
     saw_choice = False
     for chunk in events:
+        response_id = chunk.get("id") or response_id
         model = chunk.get("model") or model
         if chunk.get("usage"):
             usage = chunk["usage"]
@@ -695,6 +702,8 @@ def _reconstruct_chat_sse(events: list[dict[str, Any]]) -> Optional[dict[str, An
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
     }
+    if response_id is not None:
+        result["id"] = response_id
     if usage:
         result["usage"] = usage
     return result

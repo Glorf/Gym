@@ -32,6 +32,10 @@ from tqdm.asyncio import tqdm
 from wandb import Table
 
 from nemo_gym import PARENT_DIR
+from nemo_gym.agent_execution_capture import (
+    clear_agent_execution_captures_for_rollouts,
+    merge_agent_execution_capture_into_record,
+)
 from nemo_gym.base_resources_server import AggregateMetrics, AggregateMetricsRequest
 from nemo_gym.base_responses_api_model import (
     clear_model_call_captures_for_rollouts,
@@ -525,8 +529,9 @@ class RolloutCollectionHelper(BaseModel):
         # Run-scoping: a fresh (non-resume) run must not append onto a prior run's captures for the
         # same rollout ids, so clear the capture files this run is about to (re)write.
         if capture_dirs and not config.resume_from_cache:
-            print("Clearing previously captured model calls because resume_from_cache=false")
+            print("Clearing previous observability captures because resume_from_cache=false")
             clear_model_call_captures_for_rollouts(input_rows, capture_dirs)
+            clear_agent_execution_captures_for_rollouts(input_rows, capture_dirs)
 
         pcts_to_print = [20, 40, 60, 80, 90, 95, 98, 99, 100]
         counts_left = Counter(r[AGENT_REF_KEY_NAME]["name"] for r in input_rows)
@@ -547,6 +552,7 @@ class RolloutCollectionHelper(BaseModel):
             # when capture is off). Never alters the harness output/reward already in `result`.
             if capture_dirs:
                 merge_model_call_capture_into_record(result, capture_dirs)
+                merge_agent_execution_capture_into_record(result, capture_dirs)
 
             no_persist = bool(result.get(NG_NO_PERSIST_KEY))
             failure_class = result.get(NG_FAILURE_CLASS_KEY)

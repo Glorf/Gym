@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from pytest import fixture
 
+from nemo_gym.agent_execution_capture import AgentExecutionRecorder
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
 from nemo_gym.openai_utils import (
     NeMoGymFunctionCallOutput,
@@ -83,6 +84,13 @@ def _make_model_response(outputs: list, response_id: str = "resp_001") -> dict:
 
 
 class TestApp:
+    @fixture(autouse=True)
+    def _global_config(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(
+            "responses_api_agents.browsecomp_agent.app.get_global_config_dict",
+            lambda: {"nemo_gym_log_dir": str(tmp_path)},
+        )
+
     @fixture
     def agent(self) -> BrowsecompAgent:
         return BrowsecompAgent(config=_make_config(), server_client=MagicMock(spec=ServerClient))
@@ -205,9 +213,20 @@ class TestApp:
 
     async def test_responses_one_tool_call_then_answer(self, agent: BrowsecompAgent) -> None:
         """Model makes one tool call, then answers — loop runs exactly two model steps."""
+        clock = iter([100, 250])
+        recorder = AgentExecutionRecorder(
+            "0.0",
+            agent.config.name,
+            agent.agent_execution_coverage(),
+            clock=lambda: next(clock),
+            clock_id="test-clock",
+        )
+        lock, recorders = agent._agent_execution_state()
+        with lock:
+            recorders[recorder.rollout_id] = recorder
         fn_call = _make_fn_call("search", call_id="c1", args={"queries": ["capital France"]})
         tool_response_data = _make_model_response([fn_call])
-        final_response_data = _make_model_response([_make_msg("Final Answer: Paris")])
+        final_response_data = _make_model_response([_make_msg("Final Answer: Paris")], response_id="resp_002")
 
         tool_http = MagicMock()
         tool_http.ok = True
@@ -223,6 +242,7 @@ class TestApp:
 
         request_mock = MagicMock()
         request_mock.cookies = {}
+        request_mock.path_params = {"rollout_id": recorder.rollout_id}
         response_mock = MagicMock()
         response_mock.set_cookie = MagicMock()
 
@@ -233,6 +253,19 @@ class TestApp:
 
         assert agent.server_client.post.call_count == 3  # model + tool + model
         assert result.output[-1].content[0].text == "Final Answer: Paris"
+        capture = recorder.capture()
+        span = capture.tool_spans[0]
+        assert (span.tool_call_ids, span.granularity, span.measurement_scope) == (
+            ["c1"],
+            "individual",
+            "caller_round_trip",
+        )
+        assert (span.started_ns, span.ended_ns, span.status, span.clock_id) == (100, 250, "returned", "test-clock")
+        assert (span.model_server, span.model_response_id) == ("test_model", "resp_001")
+        assert [(link.model_server, link.response_id) for link in capture.model_call_links] == [
+            ("test_model", "resp_001"),
+            ("test_model", "resp_002"),
+        ]
 
     async def test_responses_respects_max_steps(self) -> None:
         """Agent should stop after max_steps even if no final answer is given."""

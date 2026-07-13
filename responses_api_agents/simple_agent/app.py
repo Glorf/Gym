@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+from contextlib import nullcontext
 from typing import List
 
 from fastapi import Request, Response
 from pydantic import ConfigDict, ValidationError
 
+from nemo_gym.agent_execution_capture import AgentExecutionCoverage
 from nemo_gym.base_resources_server import (
     AggregateMetrics,
     AggregateMetricsRequest,
@@ -63,6 +65,12 @@ class SimpleAgentVerifyResponse(BaseVerifyResponse):
 class SimpleAgent(SimpleResponsesAPIAgent):
     config: SimpleAgentConfig
 
+    def agent_execution_coverage(self) -> AgentExecutionCoverage:
+        return AgentExecutionCoverage(lineage="partial", model_call_attribution="partial", tool_timing="exact")
+
+    def agent_execution_capture_requires_single_worker(self) -> bool:
+        return True
+
     async def responses(
         self,
         request: Request,
@@ -79,6 +87,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         step = 0
         model_server_cookies = None  # update the cookies on every model response
         resources_server_cookies = request.cookies  # update the cookies on every resources server response
+        execution_recorder = self.agent_execution_recorder_for_request(request)
 
         while True:
             step += 1
@@ -100,6 +109,11 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 raise RuntimeError(
                     f"Received an invalid response from model server: {json.dumps(model_response_json)}"
                 ) from e
+            if execution_recorder is not None:
+                execution_recorder.add_model_call_link(
+                    response_id=model_response.id,
+                    model_server=self.config.model_server.name,
+                )
 
             output = model_response.output
             new_outputs.extend(output)
@@ -145,19 +159,32 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     new_outputs.append(tool_response)
                     continue
 
-                api_response = await self.server_client.post(
-                    server_name=self.config.resources_server.name,
-                    url_path=f"/{output_function_call.name}",
-                    json=parsed_arguments,
-                    cookies=resources_server_cookies,
+                tool_span = (
+                    execution_recorder.tool_span(
+                        tool_call_ids=[output_function_call.call_id],
+                        granularity="individual",
+                        measurement_scope="caller_round_trip",
+                        model_server=self.config.model_server.name,
+                        model_response_id=model_response.id,
+                    )
+                    if execution_recorder is not None
+                    else nullcontext()
                 )
-                # We don't raise for status here since it's a valid return for the API to error e.g. if the model outputs an invalid call or something.
-                resources_server_cookies = api_response.cookies
+                with tool_span:
+                    api_response = await self.server_client.post(
+                        server_name=self.config.resources_server.name,
+                        url_path=f"/{output_function_call.name}",
+                        json=parsed_arguments,
+                        cookies=resources_server_cookies,
+                    )
+                    # We don't raise for status here since it's a valid return for the API to error e.g. if the model outputs an invalid call or something.
+                    resources_server_cookies = api_response.cookies
+                    tool_output = (await api_response.content.read()).decode()
 
                 tool_response = NeMoGymFunctionCallOutput(
                     type="function_call_output",
                     call_id=output_function_call.call_id,
-                    output=(await api_response.content.read()).decode(),
+                    output=tool_output,
                 )
                 new_outputs.append(tool_response)
 

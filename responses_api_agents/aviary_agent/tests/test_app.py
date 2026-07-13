@@ -13,10 +13,11 @@
 # limitations under the License.
 import json
 import uuid
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from fastapi.testclient import TestClient
 
+from nemo_gym.agent_execution_capture import AgentExecutionRecorder
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymResponseCreateParamsNonStreaming,
@@ -33,6 +34,79 @@ from responses_api_agents.aviary_agent.app import (
 
 
 class TestApp:
+    async def test_parallel_actions_are_one_opaque_batch_span(self) -> None:
+        config = AviaryAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="aviary",
+            model_server=ModelServerRef(type="responses_api_models", name="policy_model"),
+            resources_server=ResourcesServerRef(type="resources_servers", name="environment"),
+            max_steps=1,
+        )
+        agent = AviaryAgent(config=config, server_client=MagicMock(spec=ServerClient))
+        recorder = AgentExecutionRecorder(
+            "3-1",
+            "aviary",
+            agent.agent_execution_coverage(),
+            clock=iter([100, 175]).__next__,
+            clock_id="test-clock",
+        )
+
+        response = AsyncMock()
+        response.json.side_effect = [
+            {"env_id": "env-1", "obs": [{"role": "user", "content": "start"}], "tools": []},
+            {
+                "id": "resp-parallel",
+                "created_at": 0.0,
+                "model": "model",
+                "object": "response",
+                "output": [
+                    NeMoGymResponseFunctionToolCall(call_id="call-a", name="a", arguments="{}").model_dump(),
+                    NeMoGymResponseFunctionToolCall(call_id="call-b", name="b", arguments="{}").model_dump(),
+                ],
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+            },
+            {
+                "obs": [
+                    {"type": "function_call_output", "call_id": "call-a", "output": "a"},
+                    {"type": "function_call_output", "call_id": "call-b", "output": "b"},
+                ],
+                "reward": 1.0,
+                "done": True,
+            },
+        ]
+        response.raise_for_status = MagicMock()
+        response.cookies = None
+        agent.server_client.post = AsyncMock(return_value=response)
+
+        request = AviaryAgentRunRequest(
+            task_idx=3,
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+        )
+        with patch.object(AviaryAgent, "agent_execution_recorder_for_run", return_value=recorder):
+            await agent.responses(request)
+
+        assert agent.agent_execution_coverage().model_dump() == {
+            "lineage": "partial",
+            "model_call_attribution": "partial",
+            "tool_timing": "partial",
+        }
+        capture = recorder.capture()
+        assert [(link.model_server, link.response_id) for link in capture.model_call_links] == [
+            ("policy_model", "resp-parallel")
+        ]
+        span = capture.tool_spans[0]
+        assert (span.tool_call_ids, span.granularity, span.measurement_scope) == (
+            ["call-a", "call-b"],
+            "batch",
+            "opaque_environment_step",
+        )
+        assert (span.started_ns, span.ended_ns, span.status, span.clock_id) == (100, 175, "returned", "test-clock")
+        assert (span.model_server, span.model_response_id) == ("policy_model", "resp-parallel")
+
     def test_lifecycle(self) -> None:
         config = AviaryAgentConfig(
             host="0.0.0.0",

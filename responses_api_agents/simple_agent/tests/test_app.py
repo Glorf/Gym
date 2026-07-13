@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
+from nemo_gym.agent_execution_capture import AgentExecutionRecorder
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymFunctionCallOutput,
@@ -271,6 +272,91 @@ class TestApp:
         # The exception type must be visible to the model — repr(e) on a
         # JSONDecodeError starts with the class name.
         assert "JSONDecodeError" in error_payload["error"]
+
+    async def test_responses_records_individual_tool_timing(self) -> None:
+        config = SimpleAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="test_agent",
+            model_server=ModelServerRef(type="responses_api_models", name="test_model"),
+            resources_server=ResourcesServerRef(type="resources_servers", name="test_resources"),
+        )
+        server = SimpleAgent(config=config, server_client=MagicMock(spec=ServerClient))
+        clock = iter([100, 250])
+        recorder = AgentExecutionRecorder(
+            "0.0",
+            config.name,
+            server.agent_execution_coverage(),
+            clock=lambda: next(clock),
+            clock_id="test-clock",
+        )
+        lock, recorders = server._agent_execution_state()
+        with lock:
+            recorders[recorder.rollout_id] = recorder
+
+        response_base = {
+            "created_at": 0.0,
+            "model": "test_model",
+            "object": "response",
+            "parallel_tool_calls": False,
+            "tool_choice": "auto",
+            "tools": [],
+        }
+        tool_model_response = response_base | {
+            "id": "resp_tool",
+            "output": [
+                {
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": '{"query":"x"}',
+                    "type": "function_call",
+                }
+            ],
+        }
+        final_model_response = response_base | {
+            "id": "resp_final",
+            "output": [
+                {
+                    "id": "msg_1",
+                    "content": [{"annotations": [], "text": "done", "type": "output_text"}],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+        }
+
+        first_model_http = MagicMock(ok=True, cookies={})
+        first_model_http.read = AsyncMock(return_value=json.dumps(tool_model_response).encode())
+        tool_http = MagicMock(ok=True, cookies={})
+        tool_http.content.read = AsyncMock(return_value=b"result")
+        final_model_http = MagicMock(ok=True, cookies={})
+        final_model_http.read = AsyncMock(return_value=json.dumps(final_model_response).encode())
+        server.server_client.post = AsyncMock(side_effect=[first_model_http, tool_http, final_model_http])
+
+        request = MagicMock(cookies={}, path_params={"rollout_id": recorder.rollout_id})
+        response = MagicMock()
+        await server.responses(
+            request,
+            response,
+            NeMoGymResponseCreateParamsNonStreaming(input=[{"role": "user", "content": "hello"}]),
+        )
+
+        capture = recorder.capture()
+        span = capture.tool_spans[0]
+        assert (span.tool_call_ids, span.granularity, span.measurement_scope) == (
+            ["call_1"],
+            "individual",
+            "caller_round_trip",
+        )
+        assert (span.started_ns, span.ended_ns, span.status, span.clock_id) == (100, 250, "returned", "test-clock")
+        assert (span.model_server, span.model_response_id) == ("test_model", "resp_tool")
+        assert [(link.model_server, link.response_id) for link in capture.model_call_links] == [
+            ("test_model", "resp_tool"),
+            ("test_model", "resp_final"),
+        ]
 
     async def test_responses_continues_on_reasoning_only(self, monkeypatch: MonkeyPatch) -> None:
         config = SimpleAgentConfig(

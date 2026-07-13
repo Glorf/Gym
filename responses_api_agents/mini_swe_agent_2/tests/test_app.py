@@ -14,6 +14,7 @@
 # limitations under the License.
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, Optional
@@ -23,6 +24,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from nemo_gym.agent_execution_capture import AgentExecutionRecorder
 from nemo_gym.config_types import AggregateMetricsRequest, ModelServerRef
 from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
 from nemo_gym.openai_utils import (
@@ -55,6 +57,7 @@ from responses_api_agents.mini_swe_agent_2.app import (
     _is_resolved,
     _json_dict_from_metadata,
     _message_content_to_text,
+    _model_response_ids_from_trajectory,
     _responses_create_params_to_model_kwargs,
     _run_mini_swe_v2,
     _sandbox_provider_for_config_dump,
@@ -386,6 +389,14 @@ class TestApp:
         assert any(item["type"] == "function_call_output" and item["call_id"] == "call-1" for item in output_items)
         assert any(item["type"] == "function_call_output" and item["call_id"] == "call-2" for item in output_items)
         assert raw_responses == [{"object": "response", "output": [{"type": "message", "content": "raw"}]}]
+        assert _model_response_ids_from_trajectory(
+            [
+                {"extra": {"response": {"id": "resp-1"}}},
+                {"extra": {"response": {"id": "resp-1"}}},
+                {"extra": {"response": {"id": "resp-2"}}},
+                {"extra": {}},
+            ]
+        ) == ["resp-1", "resp-2"]
 
         assert not _is_resolved("task", {})
         assert not _is_resolved("task", {"eval_report": {"task": {"resolved": True}}})
@@ -487,11 +498,26 @@ class TestApp:
         class FakeEnv:
             def __init__(self, config: dict[str, Any]) -> None:
                 self.config = config
-                self.commands: list[tuple[str, bool]] = []
+                self.commands: list[tuple[dict[str, Any] | str, bool]] = []
                 self.cleaned = False
+                self.recorder = None
 
-            def execute(self, command: str, is_eval: bool = False) -> dict[str, Any]:
+            def set_agent_execution_recorder(self, recorder: AgentExecutionRecorder) -> None:
+                self.recorder = recorder
+
+            @contextmanager
+            def capture_agent_commands(self):
+                yield
+
+            def execute(self, command: dict[str, Any] | str, is_eval: bool = False) -> dict[str, Any]:
                 self.commands.append((command, is_eval))
+                if self.recorder is not None and isinstance(command, dict):
+                    with self.recorder.tool_span(
+                        tool_call_ids=[command["tool_call_id"]],
+                        granularity="individual",
+                        measurement_scope="caller_round_trip",
+                    ):
+                        pass
                 return {"output": "tests passed", "returncode": 0}
 
             def cleanup(self) -> None:
@@ -505,7 +531,10 @@ class TestApp:
                 holder["agent_config"] = agent_config
 
             def run(self, problem_statement: str) -> dict[str, Any]:
-                assert problem_statement == "Fix the bug"
+                assert problem_statement in {"Fix the bug", "Fail after a tool call"}
+                self.env.execute({"command": "echo hi", "tool_call_id": "call-1"})
+                if problem_statement == "Fail after a tool call":
+                    raise RuntimeError("agent failed")
                 return {"exit_status": "submitted", "submission": "diff --git a/file b/file"}
 
             def save(self, path: Path | None, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -535,7 +564,10 @@ class TestApp:
                                     "arguments": json.dumps({"command": "echo hi"}),
                                 },
                             ],
-                            "extra": {"actions": [{"command": "echo hi", "tool_call_id": "call-1"}]},
+                            "extra": {
+                                "actions": [{"command": "echo hi", "tool_call_id": "call-1"}],
+                                "response": {"id": "resp-1"},
+                            },
                         },
                         {
                             "type": "function_call_output",
@@ -612,6 +644,11 @@ class TestApp:
             "env": "sandbox",
             "step_limit": 7,
             "run_golden": False,
+            "agent_execution_capture": {
+                "rollout_id": "2-1",
+                "agent_server": "mini_swe_agent_2",
+                "model_server": "test_model",
+            },
         }
 
         result = _run_mini_swe_v2(**params)
@@ -672,6 +709,22 @@ class TestApp:
                 ],
             }
         ]
+        worker_capture = result["django__django-123"]["agent_execution_capture"]
+        assert worker_capture["rollout_id"] == "2-1"
+        assert worker_capture["coverage"] == {
+            "lineage": "partial",
+            "model_call_attribution": "partial",
+            "tool_timing": "exact",
+        }
+        assert len(worker_capture["tool_spans"]) == 1
+        assert worker_capture["tool_spans"][0]["tool_call_ids"] == ["call-1"]
+        assert worker_capture["model_call_links"] == [
+            {
+                "agent_invocation_id": "root",
+                "model_server": "test_model",
+                "response_id": "resp-1",
+            }
+        ]
 
         golden_params = params | {"run_golden": True}
         result = _run_mini_swe_v2(**golden_params)
@@ -696,6 +749,18 @@ class TestApp:
 
         with pytest.raises(ValueError, match="instance_dict"):
             _run_mini_swe_v2(**(params | {"instance_dict": None}))
+
+        failing_params = params | {
+            "instance_dict": {
+                "instance_id": "django__django-123",
+                "problem_statement": "Fail after a tool call",
+                "patch": "gold",
+            }
+        }
+        with pytest.raises(RuntimeError, match="agent failed"):
+            _run_mini_swe_v2(**failing_params)
+        with pytest.raises(RuntimeError, match="agent failed"):
+            _run_mini_swe_v2(**(failing_params | {"agent_execution_capture": {}}))
 
     @patch("responses_api_agents.mini_swe_agent_2.app.ServerClient.load_from_global_config")
     @patch("responses_api_agents.mini_swe_agent_2.app.get_first_server_config_dict")
@@ -732,6 +797,83 @@ class TestApp:
 
         assert_run_mini_swe_called(mock_to_thread)
         assert mock_runner_ray_remote.remote.call_args.args[1]["base_url"] == ("http://0.0.0.0:8080/ng-rollout/2-1/v1")
+        assert "agent_execution_capture" not in mock_runner_ray_remote.remote.call_args.args[1]
+
+    @patch("responses_api_agents.mini_swe_agent_2.app.ServerClient.load_from_global_config")
+    @patch("responses_api_agents.mini_swe_agent_2.app.get_first_server_config_dict")
+    @patch("responses_api_agents.mini_swe_agent_2.app.get_config_path")
+    @patch("responses_api_agents.mini_swe_agent_2.app.runner_ray_remote")
+    @patch("asyncio.to_thread")
+    async def test_run_merges_worker_execution_capture_into_owner(
+        self,
+        mock_to_thread,
+        mock_runner_ray_remote,
+        mock_get_config_path,
+        mock_get_first_server_config_dict,
+        mock_load_from_global_config,
+    ) -> None:
+        config = create_test_config()
+        mock_server_client = MagicMock(spec=ServerClient)
+        mock_server_client.global_config_dict = {"observability_enabled": True}
+        server = MiniSWEAgent(config=config, server_client=mock_server_client)
+
+        setup_server_client_mocks(mock_load_from_global_config, mock_get_first_server_config_dict)
+        setup_config_path_mock(mock_get_config_path)
+
+        request = MiniSWEAgentRunRequest.model_validate(
+            create_run_request().model_dump() | {TASK_INDEX_KEY_NAME: 2, ROLLOUT_INDEX_KEY_NAME: 1}
+        )
+        owner = AgentExecutionRecorder(
+            "2-1",
+            "mini_swe_agent_2",
+            server.agent_execution_coverage(),
+        )
+        lock, active_recorders = server._agent_execution_state()
+        with lock:
+            active_recorders["2-1"] = owner
+
+        worker = AgentExecutionRecorder(
+            "2-1",
+            "mini_swe_agent_2",
+            server.agent_execution_coverage(),
+            clock=iter([10, 20]).__next__,
+            clock_id="ray-worker-clock",
+        )
+        with worker.tool_span(
+            tool_call_ids=["call-1"],
+            granularity="individual",
+            measurement_scope="caller_round_trip",
+        ):
+            pass
+        worker.add_model_call_link(response_id="resp-1", model_server="test_model")
+        worker_result = json.loads(json.dumps(DEFAULT_RUN_MINI_SWE_RESULT))
+        worker_result["test_instance_123"]["agent_execution_capture"] = worker.capture().model_dump()
+        setup_run_mini_swe_mock(mock_to_thread, mock_runner_ray_remote, worker_result)
+
+        response = await server.run(request)
+
+        ray_params = mock_runner_ray_remote.remote.call_args.args[1]
+        assert ray_params["agent_execution_capture"] == {
+            "rollout_id": "2-1",
+            "agent_server": "mini_swe_agent_2",
+            "model_server": "test_model",
+        }
+        assert response.reward == 1.0
+        assert response.response.output
+        capture = owner.capture()
+        assert len(capture.tool_spans) == 1
+        assert capture.tool_spans[0].tool_call_ids == ["call-1"]
+        assert capture.tool_spans[0].clock_id == "ray-worker-clock"
+        assert capture.model_call_links[0].response_id == "resp-1"
+
+        server.adopt_agent_execution_capture(
+            request,
+            {"invalid": "capture"},
+        )
+        capture = owner.capture()
+        assert capture.capture_complete is False
+        assert capture.warnings == ["invalid_worker_agent_execution_capture"]
+        assert len(capture.tool_spans) == 1
 
     @patch("responses_api_agents.mini_swe_agent_2.app.ServerClient.load_from_global_config")
     @patch("responses_api_agents.mini_swe_agent_2.app.get_first_server_config_dict")

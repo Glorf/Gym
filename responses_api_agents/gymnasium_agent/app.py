@@ -15,9 +15,12 @@
 
 """Agent for GymnasiumServer resources servers (resources_servers.gymnasium) which implements the Gymnasium API."""
 
+from contextlib import nullcontext
+
 from fastapi import Body, Request, Response
 from pydantic import ConfigDict, Field
 
+from nemo_gym.agent_execution_capture import AgentExecutionCoverage
 from nemo_gym.base_resources_server import (
     BaseRunRequest,
     BaseVerifyResponse,
@@ -29,6 +32,7 @@ from nemo_gym.openai_utils import (
     NeMoGymFunctionCallOutput,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
+    NeMoGymResponseFunctionToolCall,
 )
 from nemo_gym.server_utils import get_response_json, raise_for_status
 from resources_servers.gymnasium import EnvResetResponse, EnvStepResponse
@@ -54,6 +58,9 @@ class GymnasiumRunResponse(BaseVerifyResponse):
 class GymnasiumAgent(SimpleResponsesAPIAgent):
     config: GymnasiumAgentConfig
 
+    def agent_execution_coverage(self) -> AgentExecutionCoverage:
+        return AgentExecutionCoverage(lineage="partial", model_call_attribution="partial", tool_timing="partial")
+
     async def responses(
         self,
         request: Request,
@@ -75,6 +82,7 @@ class GymnasiumAgent(SimpleResponsesAPIAgent):
     async def run(self, request: Request, body: GymnasiumAgentRunRequest) -> GymnasiumRunResponse:
         env_cookies = request.cookies
         model_url_path = self.url_path_for_run("/v1/responses", body)
+        recorder = self.agent_execution_recorder_for_run(body)
 
         reset_resp = await self.server_client.post(
             server_name=self.config.resources_server.name,
@@ -113,6 +121,11 @@ class GymnasiumAgent(SimpleResponsesAPIAgent):
             )
             await raise_for_status(model_resp)
             model_response = NeMoGymResponse.model_validate(await get_response_json(model_resp))
+            if recorder is not None:
+                recorder.add_model_call_link(
+                    response_id=model_response.id,
+                    model_server=self.config.model_server.name,
+                )
             model_server_cookies = model_resp.cookies
             last_model_response = model_response
 
@@ -128,14 +141,29 @@ class GymnasiumAgent(SimpleResponsesAPIAgent):
                     usage.input_tokens_details.cached_tokens = 0
                     usage.output_tokens_details.reasoning_tokens = 0
 
-            step_resp = await self.server_client.post(
-                server_name=self.config.resources_server.name,
-                url_path="/step",
-                json=body.model_dump() | {"response": model_response.model_dump()},
-                cookies=env_cookies,
+            tool_call_ids = [
+                item.call_id for item in model_response.output if isinstance(item, NeMoGymResponseFunctionToolCall)
+            ]
+            span = (
+                recorder.tool_span(
+                    tool_call_ids=tool_call_ids,
+                    granularity="batch",
+                    measurement_scope="opaque_environment_step",
+                    model_server=self.config.model_server.name,
+                    model_response_id=model_response.id,
+                )
+                if recorder is not None and tool_call_ids
+                else nullcontext()
             )
-            await raise_for_status(step_resp)
-            step_data = EnvStepResponse.model_validate(await get_response_json(step_resp))
+            with span:
+                step_resp = await self.server_client.post(
+                    server_name=self.config.resources_server.name,
+                    url_path="/step",
+                    json=body.model_dump() | {"response": model_response.model_dump()},
+                    cookies=env_cookies,
+                )
+                await raise_for_status(step_resp)
+                step_data = EnvStepResponse.model_validate(await get_response_json(step_resp))
             total_reward += step_data.reward
             env_cookies = step_resp.cookies
 

@@ -28,6 +28,7 @@ import model_tools  # noqa: F401  # fail-fast if hermes-agent isn't installed  #
 from fastapi import Request
 from pydantic import ConfigDict
 
+from nemo_gym.agent_execution_capture import AgentExecutionCoverage
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import (
     BaseResponsesAPIAgentConfig,
@@ -185,6 +186,13 @@ class HermesAgent(SimpleResponsesAPIAgent):
     active_agents: set = None
     sigterm_installed: bool = False
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def agent_execution_coverage(self) -> AgentExecutionCoverage:
+        return AgentExecutionCoverage(
+            lineage="partial",
+            model_call_attribution="unavailable",
+            tool_timing="unavailable",
+        )
 
     def _ensure_sigterm_handler(self) -> None:
         """Install exactly one SIGTERM handler on the event loop that interrupts *every* in-flight

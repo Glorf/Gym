@@ -15,6 +15,7 @@
 
 from typing import Any
 
+from nemo_gym.agent_execution_capture import AgentExecutionCoverage, AgentExecutionRecorder
 from responses_api_agents.mini_swe_agent_2.sandbox_environment import (
     MiniSWESandboxEnvironment,
     MiniSWESandboxEnvironmentConfig,
@@ -102,6 +103,8 @@ def test_execute_passes_configured_cwd_to_exec() -> None:
         activate_conda=False,
     )
     env._sandbox = fake_sandbox
+    env._agent_execution_recorder = None
+    env._capture_agent_commands = False
 
     assert env.execute("pwd", cwd="/repo") == {"output": "ok", "returncode": 0, "exception_info": ""}
     assert fake_sandbox.calls[-1]["command"] == "pwd"
@@ -114,3 +117,67 @@ def test_execute_passes_configured_cwd_to_exec() -> None:
     assert "for __base in" in cmd and "conda activate testbed && python -V" in cmd
     assert "cd /repo" not in cmd
     assert fake_sandbox.calls[-1]["cwd"] == "/repo"
+
+
+def test_execute_records_only_agent_selected_commands() -> None:
+    class FakeSandbox:
+        def exec(self, _command: str, **_kwargs: Any):
+            return type("Result", (), {"stdout": "ok", "stderr": None, "return_code": 0})()
+
+    ticks = iter([100, 250])
+    recorder = AgentExecutionRecorder(
+        "2-1",
+        "mini_swe_agent_2",
+        AgentExecutionCoverage(lineage="exact", model_call_attribution="exact", tool_timing="exact"),
+        clock=lambda: next(ticks),
+        clock_id="mini-swe-worker-clock",
+    )
+    env = MiniSWESandboxEnvironment.__new__(MiniSWESandboxEnvironment)
+    env.config = MiniSWESandboxEnvironmentConfig(
+        image="image:tag",
+        provider={"fake": {}},
+        cwd="/workspace",
+    )
+    env._sandbox = FakeSandbox()
+    env._capture_agent_commands = False
+    env.set_agent_execution_recorder(recorder)
+
+    env.execute({"command": "setup", "tool_call_id": "setup-call"})
+    with env.capture_agent_commands():
+        env.execute({"command": "agent", "tool_call_id": "call-1"})
+        env.execute({"command": "grade", "tool_call_id": "grade-call"}, is_eval=True)
+    env.execute({"command": "cleanup", "tool_call_id": "cleanup-call"})
+
+    capture = recorder.capture()
+    assert len(capture.tool_spans) == 1
+    span = capture.tool_spans[0]
+    assert span.tool_call_ids == ["call-1"]
+    assert span.granularity == "individual"
+    assert span.measurement_scope == "caller_round_trip"
+    assert span.clock_id == "mini-swe-worker-clock"
+    assert (span.started_ns, span.ended_ns, span.status) == (100, 250, "returned")
+
+
+def test_execute_without_active_capture_does_not_read_the_clock() -> None:
+    class FakeSandbox:
+        def exec(self, _command: str, **_kwargs: Any):
+            return type("Result", (), {"stdout": "ok", "stderr": None, "return_code": 0})()
+
+    def unexpected_clock_read() -> int:
+        raise AssertionError("capture-disabled execution must not read the recorder clock")
+
+    recorder = AgentExecutionRecorder(
+        "2-1",
+        "mini_swe_agent_2",
+        AgentExecutionCoverage(lineage="exact", model_call_attribution="exact", tool_timing="exact"),
+        clock=unexpected_clock_read,
+    )
+    env = MiniSWESandboxEnvironment.__new__(MiniSWESandboxEnvironment)
+    env.config = MiniSWESandboxEnvironmentConfig(image="image:tag", provider={"fake": {}})
+    env._sandbox = FakeSandbox()
+    env._capture_agent_commands = False
+    env.set_agent_execution_recorder(recorder)
+
+    env.execute({"command": "setup", "tool_call_id": "setup-call"})
+
+    assert recorder.capture().tool_spans == []

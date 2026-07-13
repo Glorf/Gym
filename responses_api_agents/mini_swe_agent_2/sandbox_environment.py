@@ -16,8 +16,9 @@
 
 import os
 import shlex
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 
 try:
@@ -32,6 +33,7 @@ except ModuleNotFoundError:
             super().__init__()
 
 
+from nemo_gym.agent_execution_capture import AgentExecutionRecorder
 from nemo_gym.sandbox import Sandbox, SandboxResources, SandboxSpec
 from nemo_gym.sandbox.utils import rewrite_image
 
@@ -75,6 +77,8 @@ class MiniSWESandboxEnvironment:
 
         self._sandbox: Sandbox | None = None
         self._closed = False
+        self._agent_execution_recorder: AgentExecutionRecorder | None = None
+        self._capture_agent_commands = False
 
         spec_config = dict(self.config.spec)
         image = spec_config.pop("image", None) or self.config.image
@@ -137,6 +141,20 @@ class MiniSWESandboxEnvironment:
             f"conda activate {quoted_env} && {command}"
         )
 
+    def set_agent_execution_recorder(self, recorder: AgentExecutionRecorder) -> None:
+        """Install the worker-local recorder used while the MiniSWE loop is active."""
+        self._agent_execution_recorder = recorder
+
+    @contextmanager
+    def capture_agent_commands(self) -> Iterator[None]:
+        """Limit capture to commands selected by the agent, excluding setup and grading."""
+        previous = getattr(self, "_capture_agent_commands", False)
+        self._capture_agent_commands = True
+        try:
+            yield
+        finally:
+            self._capture_agent_commands = previous
+
     def execute(
         self,
         action: dict[str, Any] | str,
@@ -150,12 +168,27 @@ class MiniSWESandboxEnvironment:
         if self._sandbox is None:
             raise RuntimeError("Sandbox is not available")
 
-        result = self._sandbox.exec(
-            self._command(command),
-            timeout_s=timeout_s,
-            cwd=exec_cwd,
-            user=self.config.user,
+        recorder = self._agent_execution_recorder if self._capture_agent_commands and not is_eval else None
+        tool_call_id = action.get("tool_call_id") if isinstance(action, dict) else None
+
+        if recorder is not None and not tool_call_id:
+            recorder.mark_incomplete("mini_swe_agent_command_missing_tool_call_id")
+        span = (
+            recorder.tool_span(
+                tool_call_ids=[str(tool_call_id)],
+                granularity="individual",
+                measurement_scope="caller_round_trip",
+            )
+            if recorder is not None and tool_call_id
+            else nullcontext()
         )
+        with span:
+            result = self._sandbox.exec(
+                self._command(command),
+                timeout_s=timeout_s,
+                cwd=exec_cwd,
+                user=self.config.user,
+            )
         output = "\n".join(part for part in (result.stdout, result.stderr) if part)
         response = {
             "output": output,

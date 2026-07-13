@@ -52,6 +52,14 @@ class TestSanity:
         agent = HermesAgent(config=_config(concurrency=4), server_client=MagicMock(spec=ServerClient))
         assert agent.sem._value == 4
 
+    def test_execution_capture_declares_dependency_limits(self) -> None:
+        agent = HermesAgent(config=_config(), server_client=MagicMock(spec=ServerClient))
+        assert agent.agent_execution_coverage().model_dump() == {
+            "lineage": "partial",
+            "model_call_attribution": "unavailable",
+            "tool_timing": "unavailable",
+        }
+
 
 class _FakeAgent:
     """Stand-in for AIAgent — only needs .interrupt() for the SIGTERM dispatch path."""

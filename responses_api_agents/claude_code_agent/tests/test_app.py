@@ -23,6 +23,7 @@ import pytest
 import yaml
 from fastapi import Request
 
+from nemo_gym.agent_execution_capture import AgentExecutionCoverage, AgentExecutionRecorder
 from nemo_gym.global_config import SKILLS_REF_KEY_NAME
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
@@ -38,6 +39,7 @@ from responses_api_agents.claude_code_agent.app import (
     ClaudeCodeAgentRunRequest,
     ModelServerRef,
     ResourcesServerRef,
+    _ClaudeStreamObserver,
     _extract_instruction,
     parse_stream_json,
 )
@@ -73,6 +75,32 @@ def _event(type_: str, **kwargs) -> str:
     return json.dumps({"type": type_, **kwargs})
 
 
+def _assistant_tool_event(
+    response_id: str,
+    tool_call_id: str,
+    name: str,
+    *,
+    parent_id: str | None = None,
+    tool_input: dict | None = None,
+) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "id": response_id,
+            "content": [{"type": "tool_use", "id": tool_call_id, "name": name, "input": tool_input or {}}],
+        },
+        "parent_tool_use_id": parent_id,
+    }
+
+
+def _tool_result_event(tool_call_id: str, *, parent_id: str | None = None, is_error: bool = False) -> dict:
+    return {
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": tool_call_id, "is_error": is_error}]},
+        "parent_tool_use_id": parent_id,
+    }
+
+
 class FakeAioHTTPResponse:
     ok = True
 
@@ -82,6 +110,30 @@ class FakeAioHTTPResponse:
 
     async def read(self) -> bytes:
         return json.dumps(self.payload).encode()
+
+
+class FakeStreamProc:
+    def __init__(self, stdout: bytes, *, returncode: int = 0, wait_for_kill: bool = False) -> None:
+        self.returncode = returncode
+        self.wait_for_kill = wait_for_kill
+        self.killed = asyncio.Event()
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_data(stdout)
+        self.stderr = asyncio.StreamReader()
+        if not wait_for_kill:
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+
+    async def wait(self) -> int:
+        if self.wait_for_kill:
+            await self.killed.wait()
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        self.killed.set()
 
 
 class TestSanity:
@@ -377,6 +429,78 @@ class TestRunClaudeCode:
         # skills present => --bare must be dropped even though config.bare is True
         assert "--bare" not in captured["cmd"]
 
+    def test_execution_recorder_observes_stream_while_process_runs(self, tmp_path: Path) -> None:
+        agent = _make_agent(model_server=ModelServerRef(type="responses_api_models", name="policy"))
+        recorder = AgentExecutionRecorder("0-0", "claude_code_agent", agent.agent_execution_coverage())
+        lines = [
+            _event(
+                "assistant",
+                message={
+                    "id": "msg-1",
+                    "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {}}],
+                },
+                parent_tool_use_id=None,
+            ),
+            _event(
+                "user",
+                message={"content": [{"type": "tool_result", "tool_use_id": "tool-1"}]},
+                parent_tool_use_id=None,
+            ),
+        ]
+
+        async def fake_exec(*cmd, **kwargs):
+            return FakeStreamProc(("\n".join(lines) + "\n").encode())
+
+        with (
+            patch("responses_api_agents.claude_code_agent.app.Path.home", return_value=tmp_path),
+            patch.object(agent, "_resolve_base_url", return_value="http://model-server:9000"),
+            patch("responses_api_agents.claude_code_agent.app.asyncio.create_subprocess_exec", fake_exec),
+        ):
+            stdout, _ = asyncio.run(agent._run_claude_code("hello", execution_recorder=recorder))
+
+        assert stdout == "\n".join(lines) + "\n"
+        capture = recorder.capture()
+        assert capture.model_call_links[0].response_id == "msg-1"
+        assert capture.tool_spans[0].tool_call_ids == ["tool-1"]
+        assert capture.capture_complete is True
+
+    def test_execution_recorder_marks_invalid_stream_and_nonzero_exit(self, tmp_path: Path) -> None:
+        agent = _make_agent()
+        recorder = AgentExecutionRecorder("0-0", "claude_code_agent", agent.agent_execution_coverage())
+
+        async def fake_exec(*cmd, **kwargs):
+            return FakeStreamProc(b"not-json\n", returncode=2)
+
+        with (
+            patch("responses_api_agents.claude_code_agent.app.Path.home", return_value=tmp_path),
+            patch("responses_api_agents.claude_code_agent.app.asyncio.create_subprocess_exec", fake_exec),
+        ):
+            asyncio.run(agent._run_claude_code("hello", execution_recorder=recorder))
+
+        capture = recorder.capture()
+        assert capture.capture_complete is False
+        assert capture.warnings == ["claude_stream_event_invalid", "claude_code_nonzero_exit"]
+
+    def test_execution_recorder_timeout_kills_and_drains_process(self, tmp_path: Path) -> None:
+        agent = _make_agent(timeout=0)
+        recorder = AgentExecutionRecorder("0-0", "claude_code_agent", agent.agent_execution_coverage())
+        processes: list[FakeStreamProc] = []
+
+        async def fake_exec(*cmd, **kwargs):
+            process = FakeStreamProc(b"", wait_for_kill=True)
+            processes.append(process)
+            return process
+
+        with (
+            patch("responses_api_agents.claude_code_agent.app.Path.home", return_value=tmp_path),
+            patch("responses_api_agents.claude_code_agent.app.asyncio.create_subprocess_exec", fake_exec),
+        ):
+            stdout, _ = asyncio.run(agent._run_claude_code("hello", execution_recorder=recorder))
+
+        assert stdout == ""
+        assert processes[0].killed.is_set()
+        assert recorder.capture().warnings == ["claude_code_timeout"]
+
     def test_bad_skills_path_does_not_leak_config_dir(self, tmp_path: Path) -> None:
         # stage_skills raises for a missing skills dir; the partially-created config dir must
         # still be cleaned up (setup happens inside the try whose finally rmtree's it).
@@ -645,6 +769,73 @@ class TestRolloutCorrelation:
         # so a prefix would 404 every /v1/messages call.
         anthropic = _make_agent(anthropic_base_url="https://api.anthropic.com")
         assert anthropic._resolve_call_base_url("t3-r1") == "https://api.anthropic.com"
+
+
+class TestClaudeStreamObserver:
+    def _recorder(
+        self, clock, *, model_server: str | None = "policy"
+    ) -> tuple[AgentExecutionRecorder, _ClaudeStreamObserver]:
+        recorder = AgentExecutionRecorder(
+            "0-0",
+            "claude_code_agent",
+            AgentExecutionCoverage(lineage="partial", model_call_attribution="partial", tool_timing="partial"),
+        )
+        observer = _ClaudeStreamObserver(recorder, model_server=model_server, clock=clock)
+        return recorder, observer
+
+    def test_parallel_tool_events_keep_individual_overlapping_intervals(self) -> None:
+        recorder, observer = self._recorder(iter([10, 20, 50, 80]).__next__)
+        observer.observe(_assistant_tool_event("msg-1", "a", "Bash"))
+        observer.observe(_assistant_tool_event("msg-1", "b", "Read"))
+        observer.observe(_tool_result_event("a"))
+        observer.observe(_tool_result_event("b", is_error=True))
+
+        spans = {span.tool_call_ids[0]: span for span in recorder.capture().tool_spans}
+        assert (spans["a"].started_ns, spans["a"].ended_ns, spans["a"].status) == (10, 50, "returned")
+        assert (spans["b"].started_ns, spans["b"].ended_ns, spans["b"].status) == (20, 80, "returned")
+        assert spans["b"].started_ns < spans["a"].ended_ns
+        assert recorder.capture().model_call_links[0].response_id == "msg-1"
+
+    def test_nested_agent_events_form_tree_and_attribute_model_calls(self) -> None:
+        recorder, observer = self._recorder(iter([10, 20, 30, 40, 50, 60]).__next__)
+        events = [
+            _assistant_tool_event("msg-root", "child", "Agent", tool_input={"subagent_type": "Explore"}),
+            _assistant_tool_event("msg-child", "grandchild", "Task", parent_id="child"),
+            _assistant_tool_event("msg-grandchild", "bash", "Bash", parent_id="grandchild"),
+            _tool_result_event("bash", parent_id="grandchild"),
+            _tool_result_event("grandchild", parent_id="child"),
+            _tool_result_event("child"),
+        ]
+        for event in events:
+            observer.observe(event)
+        observer.finish()
+
+        capture = recorder.capture()
+        assert [(item.id, item.parent_id, item.source) for item in capture.agent_invocations] == [
+            ("root", None, "claude_code_agent"),
+            ("child", "root", "Explore"),
+            ("grandchild", "child", "Task"),
+        ]
+        assert [(link.agent_invocation_id, link.response_id) for link in capture.model_call_links] == [
+            ("root", "msg-root"),
+            ("child", "msg-child"),
+            ("grandchild", "msg-grandchild"),
+        ]
+        assert capture.capture_complete is True
+
+    def test_agent_request_without_child_events_does_not_create_invocation(self) -> None:
+        recorder, observer = self._recorder(iter([10, 20]).__next__)
+        observer.observe(_assistant_tool_event("msg-root", "child", "Agent"))
+        observer.observe(_tool_result_event("child"))
+
+        assert [item.id for item in recorder.capture().agent_invocations] == ["root"]
+
+    def test_external_model_response_id_is_not_emitted_as_capture_link(self) -> None:
+        recorder, observer = self._recorder(iter([10, 20]).__next__, model_server=None)
+        observer.observe(_assistant_tool_event("msg-external", "tool", "Bash"))
+        observer.observe(_tool_result_event("tool"))
+
+        assert recorder.capture().model_call_links == []
 
 
 class TestExtractInstruction:

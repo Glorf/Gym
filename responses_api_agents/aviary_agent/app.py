@@ -14,12 +14,14 @@
 import json
 import logging
 from collections.abc import Sequence
+from contextlib import nullcontext
 from typing import List, cast
 
 import aiohttp
 from pydantic import ConfigDict, Field, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
+from nemo_gym.agent_execution_capture import AgentExecutionCoverage
 from nemo_gym.base_resources_server import BaseRunRequest
 from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, SimpleResponsesAPIAgent
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
@@ -100,6 +102,9 @@ class AviaryAgentRunRequest(BaseRunRequest):
 class AviaryAgent(SimpleResponsesAPIAgent):
     config: AviaryAgentConfig
 
+    def agent_execution_coverage(self) -> AgentExecutionCoverage:
+        return AgentExecutionCoverage(lineage="partial", model_call_attribution="partial", tool_timing="partial")
+
     def update_agent_state(
         self,
         agent_state: NeMoGymResponseCreateParamsNonStreaming,
@@ -139,6 +144,7 @@ class AviaryAgent(SimpleResponsesAPIAgent):
     async def responses(self, req: AviaryAgentRunRequest) -> AviaryNeMoGymResponse:
         req = req.model_copy(deep=True)
         body = req.responses_create_params
+        recorder = self.agent_execution_recorder_for_run(req)
 
         if isinstance(body.input, str):
             body.input = [NeMoGymEasyInputMessage(role="user", content=body.input)]
@@ -179,14 +185,23 @@ class AviaryAgent(SimpleResponsesAPIAgent):
                 except (json.JSONDecodeError, aiohttp.ClientResponseError) as e:
                     # JSONDecodeError will be thrown if there's an underlying openai error.
                     # For now, we break. Default reward of 0 will be returned when /verify is called.
+                    if recorder is not None:
+                        recorder.mark_incomplete("model_call_failed")
                     logger.warning(f"Error calling /v1/responses: {e!r}. Response: {raw_model_response.text!r}.")
                     break
 
                 try:
                     model_response = NeMoGymResponse.model_validate(model_response_json)
                 except ValidationError as e:
+                    if recorder is not None:
+                        recorder.mark_incomplete("invalid_model_response")
                     logger.warning(f"Error validating model response: {e!r}. Response: {model_response_json!r}.")
                     break
+                if recorder is not None:
+                    recorder.add_model_call_link(
+                        response_id=model_response.id,
+                        model_server=self.config.model_server.name,
+                    )
 
                 # Parse model response
                 model_output = model_response.output
@@ -216,12 +231,25 @@ class AviaryAgent(SimpleResponsesAPIAgent):
                         successful_transition = False
                 else:
                     # Apply action to environment
-                    raw_env_response = await self.server_client.post(
-                        server_name=self.config.resources_server.name,
-                        url_path="/step",
-                        json={"action": [c.model_dump(mode="json") for c in all_fn_calls], "env_id": env_id},
+                    tool_call_ids = [call.call_id for call in all_fn_calls]
+                    span = (
+                        recorder.tool_span(
+                            tool_call_ids=tool_call_ids,
+                            granularity="batch",
+                            measurement_scope="opaque_environment_step",
+                            model_server=self.config.model_server.name,
+                            model_response_id=model_response.id,
+                        )
+                        if recorder is not None and tool_call_ids
+                        else nullcontext()
                     )
-                    env_response = AviaryStepResponse.model_validate(await raw_env_response.json())
+                    with span:
+                        raw_env_response = await self.server_client.post(
+                            server_name=self.config.resources_server.name,
+                            url_path="/step",
+                            json={"action": [c.model_dump(mode="json") for c in all_fn_calls], "env_id": env_id},
+                        )
+                        env_response = AviaryStepResponse.model_validate(await raw_env_response.json())
                     obs = env_response.obs
                     done = env_response.done
 

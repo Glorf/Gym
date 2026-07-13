@@ -26,9 +26,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
+from fastapi import Body
+from fastapi.testclient import TestClient
 
 from nemo_gym import PARENT_DIR
+from nemo_gym.agent_execution_capture import AgentExecutionCaptureStore, AgentExecutionCoverage
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.server_utils import ServerClient
 from responses_api_agents.anyterminal_agent.app import (
     _RUNNER_TEMPLATE,
     ActiveContainerProcess,
@@ -87,6 +91,50 @@ class TestRunnerTemplate:
         assert "NGTB_SAMPLING" in rendered
         assert "**SAMPLING," in rendered
         assert "HermesAgentConfig.model_fields" in rendered
+
+
+def test_run_emits_root_capture_with_unavailable_detail_coverage(tmp_path: Path) -> None:
+    class _TestAnyTerminalAgent(AnyTerminalAgent):
+        def model_post_init(self, context) -> None:
+            pass
+
+        async def responses(self, body=Body()):
+            raise NotImplementedError
+
+        async def run(self, body=Body()):
+            return {"ok": True}
+
+    server_client = MagicMock(spec=ServerClient)
+    server_client.global_config_dict = {
+        "observability_enabled": True,
+        "model_call_capture_dir": str(tmp_path),
+    }
+    agent = _TestAnyTerminalAgent.model_construct(config=_config(), server_client=server_client)
+
+    response = TestClient(agent.setup_webserver()).post(
+        "/run",
+        json={
+            "responses_create_params": {"input": []},
+            "_ng_task_index": 3,
+            "_ng_rollout_index": 4,
+        },
+    )
+
+    assert response.status_code == 200
+    capture = AgentExecutionCaptureStore(tmp_path).read("3-4")
+    assert capture is not None
+    assert capture.coverage == AgentExecutionCoverage(
+        lineage="unavailable",
+        model_call_attribution="unavailable",
+        tool_timing="unavailable",
+    )
+    assert [invocation.model_dump() for invocation in capture.agent_invocations] == [
+        {"id": "root", "parent_id": None, "source": "anyterminal_agent"}
+    ]
+    assert capture.tool_spans == []
+    assert capture.model_call_links == []
+    assert capture.capture_complete is True
+    assert capture.warnings == []
 
 
 class TestAgentKey:

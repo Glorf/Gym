@@ -671,10 +671,22 @@ class TestRolloutCollection:
             }
         )
         clear_captures = MagicMock()
+        clear_agent_captures = MagicMock()
         merge_capture = MagicMock()
+        merge_agent_capture = MagicMock()
         monkeypatch.setattr(nemo_gym.rollout_collection, "get_global_config_dict", get_global_config_dict)
         monkeypatch.setattr(nemo_gym.rollout_collection, "clear_model_call_captures_for_rollouts", clear_captures)
+        monkeypatch.setattr(
+            nemo_gym.rollout_collection,
+            "clear_agent_execution_captures_for_rollouts",
+            clear_agent_captures,
+        )
         monkeypatch.setattr(nemo_gym.rollout_collection, "merge_model_call_capture_into_record", merge_capture)
+        monkeypatch.setattr(
+            nemo_gym.rollout_collection,
+            "merge_agent_execution_capture_into_record",
+            merge_agent_capture,
+        )
 
         input_fpath = tmp_path / "input.jsonl"
         input_fpath.write_text(
@@ -697,9 +709,13 @@ class TestRolloutCollection:
         capture_dirs = [capture_dir]
         clear_captures.assert_called_once()
         assert clear_captures.call_args.args[1] == capture_dirs
+        clear_agent_captures.assert_called_once()
+        assert clear_agent_captures.call_args.args[1] == capture_dirs
         merge_capture.assert_called_once()
         assert merge_capture.call_args.args[1] == capture_dirs
-        assert "Clearing previously captured model calls" in capsys.readouterr().out
+        merge_agent_capture.assert_called_once()
+        assert merge_agent_capture.call_args.args[1] == capture_dirs
+        assert "Clearing previous observability captures" in capsys.readouterr().out
 
     async def test_run_from_config_sorted(self, tmp_path: Path, empty_global_config: MagicMock) -> None:
         input_jsonl_fpath = tmp_path / "input.jsonl"

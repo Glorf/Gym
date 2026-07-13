@@ -132,6 +132,7 @@ def test_build_model_call_record_from_exchange():
         "latency_ms": 18.4,
         "request": {"input": "hi"},
         "response": {
+            "id": "response-3",
             "model": "m",
             "usage": {
                 "input_tokens": 10,
@@ -149,7 +150,8 @@ def test_build_model_call_record_from_exchange():
     }
     rec = build_model_call_record(exchange, call_index=3)
     assert rec.call_index == 3
-    assert rec.model_server == "srv" and rec.dialect == "responses"
+    assert rec.response_id == "response-3"
+    assert rec.model_server == "srv" and rec.model == "m" and rec.dialect == "responses"
     assert (rec.tokens_in, rec.tokens_out, rec.tokens_total, rec.tokens_reasoning) == (10, 5, 15, 3)
     assert rec.cache_hit is True and rec.cached_tokens == 4
     assert rec.reasoning_content == "thinking..."
@@ -158,8 +160,10 @@ def test_build_model_call_record_from_exchange():
     assert {
         "call_index",
         "model_server",
+        "model",
         "dialect",
         "status_code",
+        "response_id",
         "tokens_in",
         "tokens_out",
         "tokens_reasoning",
@@ -731,7 +735,11 @@ def test_reconstruct_chat_sse():
     from nemo_gym.base_responses_api_model import _reconstruct_streamed_response
 
     chunks = [
-        {"model": "m", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}}]},
+        {
+            "id": "chat-response-1",
+            "model": "m",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}}],
+        },
         {"choices": [{"index": 0, "delta": {"content": "lo", "reasoning": "hmm"}}]},  # vLLM `reasoning` alias
         {
             "choices": [
@@ -756,6 +764,7 @@ def test_reconstruct_chat_sse():
     ]
     raw = (b"".join(_sse("", c) for c in chunks) + b"data: [DONE]\n\n").replace(b"\n", b"\r\n")
     resp = _reconstruct_streamed_response(raw, "chat")
+    assert resp["id"] == "chat-response-1"
     msg = resp["choices"][0]["message"]
     assert msg["content"] == "Hello" and msg["reasoning_content"] == "hmm"
     assert msg["tool_calls"][0]["function"] == {"name": "f", "arguments": '{"a":1}'}
@@ -846,6 +855,7 @@ def test_merge_capture_attaches_metrics_without_raw_payloads(tmp_path):
     assert set(capture) == {"rollout_id", "metrics", "calls"}
     assert capture["rollout_id"] == "0-0"
     assert capture["metrics"]["num_calls"] == 1
+    assert capture["calls"][0]["model"] == "m"
     assert capture["calls"][0]["tokens_in"] == 3
     assert "request" not in capture["calls"][0] and "response" not in capture["calls"][0]
     assert record["response"] == {"harness": "A"} and record["reward"] == 1.0

@@ -32,6 +32,7 @@ import ray
 from pydantic import BaseModel, ConfigDict, Field
 
 from nemo_gym import PARENT_DIR
+from nemo_gym.agent_execution_capture import AgentExecutionCoverage
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, Body, SimpleResponsesAPIAgent
 from nemo_gym.config_types import ModelServerRef
@@ -449,6 +450,13 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
 
     _sem: Optional[Semaphore] = None
     _server: Optional[AnyTerminalServerConfig] = None
+
+    def agent_execution_coverage(self) -> AgentExecutionCoverage:
+        return AgentExecutionCoverage(
+            lineage="unavailable",
+            model_call_attribution="unavailable",
+            tool_timing="unavailable",
+        )
 
     def model_post_init(self, context: Any) -> None:
         self._sem = Semaphore(self.config.concurrency)
